@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target/
+
+# Library lockfile
+Cargo.lock
+
+# Local engine data
+/data/*.pb
+
+# macOS
+.DS_Store
+
+# Editor settings
+.idea/
+.vscode/
