@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package ferrumdb;
+
+message StoreSnapshot {
+  map<string, ValueMessage> data = 1;
+}
+
+message ValueMessage {
+  oneof kind {
+    int32 integer = 1;
+    double float = 2;
+    string text = 3;
+    bool boolean = 4;
+  }
+}
