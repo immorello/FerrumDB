@@ -1,0 +1,11 @@
+[package]
+name = "ferrumdb-core"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
