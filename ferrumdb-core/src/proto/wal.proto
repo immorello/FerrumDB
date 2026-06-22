@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package ferrumdb;
+
+import "store.proto";
+
+// Operation type for WAL entries
+enum Operation {
+  PUT = 0;
+  DELETE = 1;
+}
+
+// Write-Ahead Log entry
+// Represents a single operation to be applied to the store
+message WalEntry {
+  Operation operation = 1;  // PUT or DELETE
+  string key = 2;            // Key for the operation
+  ValueMessage value = 3;   // Value (only used for PUT operations)
+  uint64 sequence = 4;       // Monotonically increasing sequence number
+  uint64 timestamp = 5;      // Optional timestamp
+}

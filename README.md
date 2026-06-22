@@ -1,53 +1,70 @@
 # FerrumDB
 
-FerrumDB is an open-source database engine written in Rust, built around typed items, persistent storage, and scalable key-based data access.
+FerrumDB is an open-source database engine written in Rust, built around typed items, durable writes, and scalable key-based data access.
 
 ## Goal
 
-This repository is the next step after the Rust learning path projects. The purpose is to move from a small educational persistent store into a more realistic database engine with clearer storage layers and better testing discipline.
+The long-term goal is to build a standalone storage engine with durable writes, immutable sorted storage files, and fast key-based access — implemented from the ground up in Rust.
 
-## Current Foundation
+This repository is the next step after a Rust learning path. The purpose is to move from small educational projects into a more realistic database engine with clear storage layers and strong testing discipline.
 
-The current codebase already includes:
+## What Has Been Built
 
-- an internal `Store` model with typed values
-- binary persistence using Protocol Buffers
-- conversion logic between internal Rust types and persisted protobuf messages
-- a clean separation between `store`, `persistence`, and `errors`
+### Write-Ahead Log (WAL)
 
-This is the seed, not the final architecture.
+The first major component is a durable Write-Ahead Log backed by Protocol Buffers.
+
+Every write (`PUT`) and delete (`DELETE`) is appended to the WAL before touching in-memory state. Each entry carries a key, a typed value, and a monotonically increasing sequence number. The format is length-prefixed binary (8-byte big-endian length followed by the protobuf payload), which makes truncated-tail detection straightforward after a crash.
+
+### Store with WAL Integration
+
+The in-memory store (`Store`) is fully wired to the WAL:
+
+- `set_value` and `delete_value` write to the WAL first, then update the in-memory state. There is no write-through snapshot on every operation.
+- The in-memory structure is a `BTreeMap`, so keys are always held in sorted lexicographic order. This is a prerequisite for the SSTable layer.
+- `save_to_file` is now a checkpoint operation — it writes a protobuf snapshot to disk and fsyncs it.
+
+### Recovery
+
+`Store::open()` is the production entry point. On startup it:
+
+1. Loads the last snapshot from disk (if one exists).
+2. Reads all WAL entries and replays them on top of the snapshot.
+3. Sets the sequence counter to the highest sequence seen, so new writes never reuse old numbers.
+
+`Store::checkpoint()` writes the current state as a snapshot and then clears and fsyncs the WAL. After a checkpoint, WAL replay on the next open starts from an empty log.
+
+### Testing
+
+The project has integration tests across three suites:
+
+- `tests/wal.rs` — append, read-back, persistence across instances, and clear
+- `tests/recovery.rs` — WAL replay on restart, delete replay, checkpoint clears WAL, snapshot-only recovery, snapshot + WAL combined recovery, sequence continuity across restarts
+- `tests/store.rs` — sorted iteration, sorted order after WAL replay, sorted order after checkpoint and recovery, set/get/delete correctness, overwrite stability
 
 ## Next Steps
 
-The next major implementation goals are:
+1. SSTable-style immutable on-disk sorted files
+2. Memtable flush: when the `BTreeMap` exceeds a size threshold, iterate it in order and write a sorted SSTable file
+3. SSTable reads and multi-file merging
+4. Compaction
 
-1. introduce a Write-Ahead Log (WAL) for durable append-first writes
-2. introduce SSTable-style immutable on-disk structures
-3. define an engine boundary that is easier to test than the current learning-project store
-4. add repeatable tests for recovery, compaction-related behavior, and read/write correctness
+## Design Notes
 
-## Near-Term Design Direction
+The storage architecture follows the LSM-tree (Log-Structured Merge-Tree) model:
 
-FerrumDB is expected to evolve toward:
+- Writes go to the WAL first (durability), then to the in-memory `BTreeMap` (the memtable).
+- Periodically the memtable is flushed to an immutable sorted SSTable file on disk.
+- On read, the memtable is checked first, then SSTables from newest to oldest.
+- Compaction merges SSTables to bound read amplification and reclaim space from deleted keys.
 
-- durable writes through a WAL
-- immutable sorted storage files
-- startup recovery from persisted state
-- clearer separation between engine logic and storage formats
-- stronger automated testing around persistence and correctness
+## Development Approach
 
-## Testing Goals
-
-Before adding more engine complexity, this project should gain a solid testing base. In practice, that means:
-
-- unit tests for internal conversions and storage primitives
-- integration tests for write/read/delete behavior
-- recovery tests that simulate restart after persisted writes
-- later, tests around WAL replay and SSTable loading
+The ideas, architecture, and design decisions behind FerrumDB are my own. I used AI (Claude) to speed up the code-writing process and catch implementation issues early. All design choices, supervision of the implementation, and review of correctness are mine.
 
 ## Repository Intent
 
-FerrumDB is not meant to be another small Rust exercise. It is the start of a standalone database project built with a narrower and more realistic storage-engine focus.
+FerrumDB is not a Rust exercise. It is the start of a standalone database engine built with a realistic storage-engine focus.
 
 ## License
 

@@ -1,10 +1,12 @@
 use crate::errors::AppError;
 use crate::proto::value_message::Kind;
 use crate::proto::{StoreSnapshot, ValueMessage};
-use crate::store::{Store, Value, STORAGE_PATH};
+use crate::store::{Store, Value};
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 impl Store {
     fn value_to_proto(value: &Value) -> ValueMessage {
@@ -44,7 +46,7 @@ impl Store {
     }
 
     pub(crate) fn proto_to_store(proto_store: StoreSnapshot) -> Result<Store, AppError> {
-        let data: Result<HashMap<String, Value>, AppError> = proto_store
+        let data: Result<BTreeMap<String, Value>, AppError> = proto_store
             .data
             .into_iter()
             .map(|(key, value_message)| {
@@ -58,12 +60,18 @@ impl Store {
     pub fn save_to_file(&self) -> Result<String, String> {
         let proto_store = self.store_to_proto_store();
         let bytes = proto_store.encode_to_vec();
-        fs::write(STORAGE_PATH, bytes).map_err(|error| error.to_string())?;
+        if let Some(parent) = Path::new(&self.snapshot_path).parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut file = fs::File::create(&self.snapshot_path).map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
         Ok("Data persisted to file".to_string())
     }
 
     pub fn load_from_file(&self) -> Result<Store, AppError> {
-        let bytes = fs::read(STORAGE_PATH).map_err(|error| AppError::IoError(error.to_string()))?;
+        let bytes = fs::read(&self.snapshot_path)
+            .map_err(|error| AppError::IoError(error.to_string()))?;
         let proto_store = StoreSnapshot::decode(bytes.as_slice())
             .map_err(|error| AppError::DecodeError(error.to_string()))?;
         Store::proto_to_store(proto_store)
