@@ -1,70 +1,121 @@
 # FerrumDB
 
-FerrumDB is an open-source database engine written in Rust, built around typed items, durable writes, and scalable key-based data access.
+FerrumDB is an embedded, no-SQL key-value storage engine written in Rust. It stores typed values (integer, float, text, boolean) accessed by key, with durable writes and crash recovery — without a query language and without a server.
 
-## Goal
+The target is the space that SQLite owns for relational data, applied to key-value workloads: IoT devices, edge nodes, mobile applications, and local-first software that needs a lightweight but correct persistent store.
 
-The long-term goal is to build a standalone storage engine with durable writes, immutable sorted storage files, and fast key-based access — implemented from the ground up in Rust.
+---
 
-This repository is the next step after a Rust learning path. The purpose is to move from small educational projects into a more realistic database engine with clear storage layers and strong testing discipline.
+## Architecture
+
+FerrumDB follows the **LSM-tree** (Log-Structured Merge-Tree) model, the same architecture used by LevelDB and RocksDB:
+
+```
+write
+  │
+  ├─ WAL (append-only log, fsynced)       ← durability
+  └─ BTreeMap memtable (sorted, in RAM)   ← fast access
+       │
+       └─ flush when full
+            │
+            └─ SSTable (immutable sorted file on disk)
+                 │
+                 └─ compaction (merge SSTables, reclaim space)
+```
+
+Reads check the memtable first, then SSTables from newest to oldest.
+
+The `BTreeMap` is the memtable data structure — it keeps keys in sorted order so that flushing to SSTable is a single in-order iteration with no extra sorting step.
+
+---
 
 ## What Has Been Built
 
 ### Write-Ahead Log (WAL)
 
-The first major component is a durable Write-Ahead Log backed by Protocol Buffers.
+Every `PUT` and `DELETE` is appended to the WAL before touching in-memory state. The format is length-prefixed binary records (8-byte big-endian length followed by a protobuf payload), which makes truncated-tail detection safe after a crash.
 
-Every write (`PUT`) and delete (`DELETE`) is appended to the WAL before touching in-memory state. Each entry carries a key, a typed value, and a monotonically increasing sequence number. The format is length-prefixed binary (8-byte big-endian length followed by the protobuf payload), which makes truncated-tail detection straightforward after a crash.
+Each entry carries a key, a typed value, and a monotonically increasing sequence number.
 
 ### Store with WAL Integration
 
-The in-memory store (`Store`) is fully wired to the WAL:
+The `Store` struct owns the WAL and the memtable:
 
-- `set_value` and `delete_value` write to the WAL first, then update the in-memory state. There is no write-through snapshot on every operation.
-- The in-memory structure is a `BTreeMap`, so keys are always held in sorted lexicographic order. This is a prerequisite for the SSTable layer.
-- `save_to_file` is now a checkpoint operation — it writes a protobuf snapshot to disk and fsyncs it.
+- `set_value` and `delete_value` write to the WAL first, then update the `BTreeMap`. The in-memory state is never touched unless the WAL write succeeds.
+- Keys are kept in sorted lexicographic order in the `BTreeMap` at all times.
+- `checkpoint()` writes a protobuf snapshot to disk (fsynced) and clears the WAL.
 
-### Recovery
+### Crash Recovery
 
 `Store::open()` is the production entry point. On startup it:
 
-1. Loads the last snapshot from disk (if one exists).
-2. Reads all WAL entries and replays them on top of the snapshot.
+1. Loads the last snapshot from disk if one exists.
+2. Replays all WAL entries on top of the snapshot.
 3. Sets the sequence counter to the highest sequence seen, so new writes never reuse old numbers.
-
-`Store::checkpoint()` writes the current state as a snapshot and then clears and fsyncs the WAL. After a checkpoint, WAL replay on the next open starts from an empty log.
 
 ### Testing
 
-The project has integration tests across three suites:
+Integration tests cover three areas:
 
-- `tests/wal.rs` — append, read-back, persistence across instances, and clear
+- `tests/wal.rs` — append, read-back, persistence across instances, clear
 - `tests/recovery.rs` — WAL replay on restart, delete replay, checkpoint clears WAL, snapshot-only recovery, snapshot + WAL combined recovery, sequence continuity across restarts
-- `tests/store.rs` — sorted iteration, sorted order after WAL replay, sorted order after checkpoint and recovery, set/get/delete correctness, overwrite stability
+- `tests/store.rs` — sorted iteration, sorted order after WAL replay and checkpoint, set/get/delete correctness, overwrite stability
 
-## Next Steps
+---
 
-1. SSTable-style immutable on-disk sorted files
-2. Memtable flush: when the `BTreeMap` exceeds a size threshold, iterate it in order and write a sorted SSTable file
-3. SSTable reads and multi-file merging
-4. Compaction
+## Roadmap
+
+### Step 1 — ACID foundation (next)
+
+The WAL handles durability. What is missing is atomicity across multiple operations and protection against concurrent access from two processes.
+
+- **COMMIT marker** — a `COMMIT` entry type in the WAL. Multiple operations are buffered in memory and written to the WAL together, followed by a COMMIT. On replay, entries without a following COMMIT are discarded. This gives multi-operation atomicity: either all writes in a transaction land or none do.
+- **Write lock** — a lockfile (`./data/LOCK`) acquired exclusively when `Store::open` is called, released when the `Store` is dropped. Prevents two processes from writing to the same store simultaneously.
+
+Together these give FerrumDB a credible single-node ACID story: serializable isolation (one writer at a time), committed-only reads (the `BTreeMap` only contains committed state), and durable commits (WAL + fsync).
+
+When indexes are added later, they will ride inside the same transaction boundary with no redesign needed.
+
+### Step 2 — SSTable layer
+
+- A size threshold on the memtable triggers a flush to an immutable sorted file on disk.
+- Reads check the memtable first, then walk SSTables from newest to oldest.
+- The SSTable file format is a binary sorted sequence of key-value records, written once and never modified.
+
+### Step 3 — Compaction
+
+- When too many SSTables accumulate, reads degrade (more files to check per lookup).
+- Compaction merges SSTables into a single file, discarding deleted keys and old versions.
+- A simple size-triggered strategy (merge all files when there are more than N) is the starting point.
+
+### Step 4 — API layer
+
+- A minimal public Rust API designed for embedding.
+- A C FFI layer so FerrumDB can be used from C, Swift, Python, and other languages — the same way SQLite is embedded across ecosystems.
+
+---
 
 ## Design Notes
 
-The storage architecture follows the LSM-tree (Log-Structured Merge-Tree) model:
+**Why LSM and not B-Tree on disk?**
 
-- Writes go to the WAL first (durability), then to the in-memory `BTreeMap` (the memtable).
-- Periodically the memtable is flushed to an immutable sorted SSTable file on disk.
-- On read, the memtable is checked first, then SSTables from newest to oldest.
-- Compaction merges SSTables to bound read amplification and reclaim space from deleted keys.
+A B-Tree storage engine requires implementing disk pages, page splits, tree rebalancing, and a page cache. LSM separates the problem: writes go to an append-only log and a sorted in-memory buffer; disk files are written once and never modified. The implementation complexity is significantly lower, and LSM write performance is better on flash storage (common in embedded targets) because it avoids random writes.
+
+**Why no SQL?**
+
+SQL requires a parser, a query planner, and a schema layer. For the target use cases — IoT devices, edge nodes, mobile apps — the application already knows its data shape. A typed key-value API with fast key-based access is sufficient and keeps the engine small and embeddable.
+
+**Why Rust?**
+
+Memory safety without a garbage collector. Predictable latency. A small binary. Rust is increasingly the right language for systems software that needs to run reliably on constrained hardware for long periods.
+
+---
 
 ## Development Approach
 
 The ideas, architecture, and design decisions behind FerrumDB are my own. I used AI (Claude) to speed up the code-writing process and catch implementation issues early. All design choices, supervision of the implementation, and review of correctness are mine.
 
-## Repository Intent
-
-FerrumDB is not a Rust exercise. It is the start of a standalone database engine built with a realistic storage-engine focus.
+---
 
 ## License
 
