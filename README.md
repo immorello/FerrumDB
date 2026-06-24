@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="ferrumdb_logo_v3.svg" alt="FerrumDB" width="400"/>
+</p>
+
 # FerrumDB
 
 FerrumDB is an embedded, no-SQL key-value storage engine written in Rust. It stores typed values (integer, float, text, boolean) accessed by key, with durable writes and crash recovery — without a query language and without a server.
