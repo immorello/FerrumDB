@@ -163,6 +163,12 @@ FerrumDB currently depends only on `prost` (protobuf encoding) and Rust's standa
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 ## Development Approach
 
 The ideas, architecture, and design decisions behind FerrumDB are my own. I used AI (Claude) to speed up the code-writing process and catch implementation issues early. All design choices, supervision of the implementation, and review of correctness are mine.
