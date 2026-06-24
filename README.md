@@ -171,7 +171,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Development Approach
 
-The ideas, architecture, and design decisions behind FerrumDB are my own. I used AI (Claude) to speed up the code-writing process and catch implementation issues early. All design choices, supervision of the implementation, and review of correctness are mine.
+FerrumDB is developed with assistance from Claude. The architecture, design decisions, and direction are mine — Claude accelerated the implementation and helped catch issues early. This is stated openly because it reflects how the project was actually built.
 
 ---
 
