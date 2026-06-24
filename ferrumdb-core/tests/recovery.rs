@@ -1,3 +1,4 @@
+use ferrumdb_core::proto::Operation;
 use ferrumdb_core::store::{Store, Value};
 use ferrumdb_core::wal::Wal;
 use std::fs;
@@ -139,7 +140,11 @@ fn test_sequence_continues_after_open() {
     }
 
     let entries = Wal::with_path(&wal).read_all().unwrap();
-    let sequences: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
+    // Filter to data entries only — COMMIT entries share the sequence of the preceding write.
+    let sequences: Vec<u64> = entries.iter()
+        .filter(|e| matches!(e.operation(), Operation::Put | Operation::Delete))
+        .map(|e| e.sequence)
+        .collect();
     assert!(
         sequences.windows(2).all(|w| w[0] < w[1]),
         "sequences must be strictly increasing: {:?}",

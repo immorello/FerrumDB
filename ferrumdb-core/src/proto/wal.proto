@@ -8,6 +8,7 @@ import "store.proto";
 enum Operation {
   PUT = 0;
   DELETE = 1;
+  COMMIT = 2;
 }
 
 // Write-Ahead Log entry

@@ -35,10 +35,10 @@ impl Wal {
         Wal { file_path }
     }
 
-    /// Appends a WAL entry to the log file
-    /// 
-    /// This is the core write operation - it appends a serialized WalEntry
-    /// to the end of the WAL file and flushes to disk for durability.
+    /// Appends a WAL entry to the log file without fsyncing.
+    ///
+    /// Not durable on its own — always follow a batch of appends with
+    /// `write_commit()` to make them durable and atomically visible on recovery.
     pub fn append(&self, entry: &WalEntry) -> Result<(), AppError> {
         let mut file = OpenOptions::new()
             .create(true)
@@ -46,25 +46,47 @@ impl Wal {
             .open(&self.file_path)
             .map_err(|e| AppError::IoError(e.to_string()))?;
 
-        // Serialize the entry to bytes
         let bytes = entry.encode_to_vec();
-
-        // Write the length prefix (8 bytes, big-endian) so we can read entries back
         let len = bytes.len() as u64;
-        file
-            .write_all(&len.to_be_bytes())
-            .map_err(|e| AppError::IoError(e.to_string()))?;
 
-        // Write the entry data
-        file
-            .write_all(&bytes)
+        file.write_all(&len.to_be_bytes())
             .map_err(|e| AppError::IoError(e.to_string()))?;
-
-        // Flush to ensure durability
+        file.write_all(&bytes)
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         file.flush()
             .map_err(|e| AppError::IoError(e.to_string()))?;
 
-        // Sync to disk for durability guarantee
+        Ok(())
+    }
+
+    /// Writes a COMMIT marker and fsyncs — makes all preceding entries durable.
+    ///
+    /// On recovery, only entries that precede a COMMIT are replayed.
+    /// Any entries after the last COMMIT are discarded (they were uncommitted at crash time).
+    pub fn write_commit(&self, sequence: u64) -> Result<(), AppError> {
+        let commit_entry = WalEntry {
+            operation: Operation::Commit.into(),
+            key: String::new(),
+            value: None,
+            sequence,
+            timestamp: 0,
+        };
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)
+            .map_err(|e| AppError::IoError(e.to_string()))?;
+
+        let bytes = commit_entry.encode_to_vec();
+        let len = bytes.len() as u64;
+
+        file.write_all(&len.to_be_bytes())
+            .map_err(|e| AppError::IoError(e.to_string()))?;
+        file.write_all(&bytes)
+            .map_err(|e| AppError::IoError(e.to_string()))?;
+        file.flush()
+            .map_err(|e| AppError::IoError(e.to_string()))?;
         file.sync_all()
             .map_err(|e| AppError::IoError(e.to_string()))?;
 

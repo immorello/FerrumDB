@@ -126,6 +126,29 @@ fn perf_checkpoint() {
     teardown(&snap, &wal);
 }
 
+// Batched transaction — N writes, one fsync. Shows the real benefit of COMMIT.
+#[test]
+fn perf_batched_transaction() {
+    let (snap, wal) = setup("batch");
+    let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+
+    let start = Instant::now();
+    let mut tx = store.begin_transaction();
+    for i in 0..N {
+        tx.set_value(format!("key_{:06}", i), Value::Integer(i as i32));
+    }
+    tx.commit().unwrap();
+    let elapsed = start.elapsed();
+
+    let ops_per_sec = N as f64 / elapsed.as_secs_f64();
+    println!(
+        "\n[batch tx]   {} writes   in {:>8.2?}  →  {:>10.0} writes/sec   (1 fsync for all)",
+        N, elapsed, ops_per_sec
+    );
+
+    teardown(&snap, &wal);
+}
+
 // Mixed workload — alternating writes and reads, simulating real usage.
 #[test]
 fn perf_mixed_write_read() {

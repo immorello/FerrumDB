@@ -10,6 +10,22 @@ use crate::proto::value_message::Kind;
 use crate::proto::{Operation, ValueMessage};
 use crate::wal::{Wal, WAL_PATH};
 
+enum TxOp {
+    Put(String, Value),
+    Delete(String),
+}
+
+/// A buffered, atomic unit of work against a single table.
+///
+/// All operations are held in memory until `commit()` is called. On commit,
+/// every entry is written to the WAL followed by a single COMMIT + fsync.
+/// Dropping a Transaction without committing is a silent rollback — nothing
+/// reaches disk.
+pub struct Transaction<'a> {
+    store: &'a mut Store,
+    ops: Vec<TxOp>,
+}
+
 pub const STORAGE_PATH: &str = "./data/storage.pb";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,20 +135,34 @@ impl Store {
         }
 
         let entries = store.wal.read_all()?;
-        for entry in &entries {
+        let mut pending: Vec<crate::proto::WalEntry> = Vec::new();
+        for entry in entries {
             match entry.operation() {
-                Operation::Put => {
-                    if let Some(value_msg) = &entry.value {
-                        let value = Store::value_from_proto(value_msg)?;
-                        store.data.insert(entry.key.clone(), value);
-                    }
+                Operation::Put | Operation::Delete => {
+                    pending.push(entry);
                 }
-                Operation::Delete => {
-                    store.data.remove(&entry.key);
+                Operation::Commit => {
+                    for e in &pending {
+                        match e.operation() {
+                            Operation::Put => {
+                                if let Some(value_msg) = &e.value {
+                                    let value = Store::value_from_proto(value_msg)?;
+                                    store.data.insert(e.key.clone(), value);
+                                }
+                            }
+                            Operation::Delete => {
+                                store.data.remove(&e.key);
+                            }
+                            _ => {}
+                        }
+                        store.sequence = store.sequence.max(e.sequence);
+                    }
+                    store.sequence = store.sequence.max(entry.sequence);
+                    pending.clear();
                 }
             }
-            store.sequence = store.sequence.max(entry.sequence);
         }
+        // Entries in `pending` have no following COMMIT — discarded (uncommitted at crash time).
 
         Ok(store)
     }
@@ -148,6 +178,7 @@ impl Store {
         self.sequence += 1;
         let entry = Wal::create_put_entry(new_key.clone(), &new_value, self.sequence);
         self.wal.append(&entry)?;
+        self.wal.write_commit(self.sequence)?;
         self.data.insert(new_key.clone(), new_value);
         Ok(format!("Inserted value with key {}", new_key))
     }
@@ -166,8 +197,17 @@ impl Store {
         self.sequence += 1;
         let entry = Wal::create_delete_entry(key.to_string(), self.sequence);
         self.wal.append(&entry)?;
+        self.wal.write_commit(self.sequence)?;
         self.data.remove(key);
         Ok(format!("Deleted value with key {}", key))
+    }
+
+    /// Begins an explicit multi-write transaction.
+    ///
+    /// Operations are buffered in memory and written atomically on `commit()`.
+    /// Dropping the transaction without committing discards all buffered ops.
+    pub fn begin_transaction(&mut self) -> Transaction<'_> {
+        Transaction { store: self, ops: Vec::new() }
     }
 
     pub fn list_values(&self) -> Result<String, AppError> {
@@ -191,7 +231,7 @@ impl Store {
         Ok(result)
     }
 
-    fn value_from_proto(msg: &ValueMessage) -> Result<Value, AppError> {
+    pub(crate) fn value_from_proto(msg: &ValueMessage) -> Result<Value, AppError> {
         match msg.kind.as_ref() {
             Some(Kind::Integer(n)) => Ok(Value::Integer(*n)),
             Some(Kind::Float(n)) => Ok(Value::Float(*n)),
@@ -201,5 +241,48 @@ impl Store {
                 "WAL entry has unknown value type".to_string(),
             )),
         }
+    }
+}
+
+impl<'a> Transaction<'a> {
+    pub fn set_value(&mut self, key: String, value: Value) {
+        self.ops.push(TxOp::Put(key, value));
+    }
+
+    /// Returns an error if the key does not exist in the store at the time this
+    /// call is made. Note: keys inserted earlier in the same transaction are not
+    /// yet visible here — check existence before beginning the transaction if needed.
+    pub fn delete_value(&mut self, key: String) -> Result<(), AppError> {
+        if !self.store.data.contains_key(&key) {
+            return Err(AppError::KeyNotFound(format!(
+                "Could not delete value with key {}",
+                key
+            )));
+        }
+        self.ops.push(TxOp::Delete(key));
+        Ok(())
+    }
+
+    /// Writes all buffered operations to the WAL, writes a COMMIT marker, fsyncs,
+    /// then applies every operation to the in-memory BTreeMap.
+    /// A single fsync covers the entire batch.
+    pub fn commit(self) -> Result<(), AppError> {
+        for op in &self.ops {
+            self.store.sequence += 1;
+            let entry = match op {
+                TxOp::Put(k, v) => Wal::create_put_entry(k.clone(), v, self.store.sequence),
+                TxOp::Delete(k) => Wal::create_delete_entry(k.clone(), self.store.sequence),
+            };
+            self.store.wal.append(&entry)?;
+        }
+        self.store.wal.write_commit(self.store.sequence)?;
+
+        for op in self.ops {
+            match op {
+                TxOp::Put(k, v) => { self.store.data.insert(k, v); }
+                TxOp::Delete(k) => { self.store.data.remove(&k); }
+            }
+        }
+        Ok(())
     }
 }
