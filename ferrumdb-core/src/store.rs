@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 use crate::errors::AppError;
 use crate::proto::value_message::Kind;
@@ -22,6 +26,8 @@ pub struct Store {
     wal: Wal,
     sequence: u64,
     pub(crate) snapshot_path: String,
+    // Held for its Drop — releasing it unlocks the table for other processes.
+    _lock: Option<File>,
 }
 
 impl Store {
@@ -31,6 +37,7 @@ impl Store {
             wal: Wal::new(),
             sequence: 0,
             snapshot_path: STORAGE_PATH.to_string(),
+            _lock: None,
         }
     }
 
@@ -44,6 +51,7 @@ impl Store {
             wal: Wal::new(),
             sequence: 0,
             snapshot_path: STORAGE_PATH.to_string(),
+            _lock: None,
         }
     }
 
@@ -53,13 +61,56 @@ impl Store {
         Self::open_with_paths(STORAGE_PATH, WAL_PATH)
     }
 
+    /// Opens a named table, storing all its files under ./data/<name>/.
+    pub fn open_table(name: &str) -> Result<Store, AppError> {
+        let snapshot = format!("./data/{}/snapshot.pb", name);
+        let wal      = format!("./data/{}/wal.log", name);
+        Self::open_with_paths(&snapshot, &wal)
+    }
+
     /// Opens a Store at custom paths. Use in tests to avoid file-level conflicts between test cases.
     pub fn open_with_paths(snapshot_path: &str, wal_path: &str) -> Result<Store, AppError> {
+        // Ensure the table directory exists before acquiring the lock.
+        if let Some(parent) = Path::new(snapshot_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AppError::IoError(e.to_string()))?;
+        }
+
+        // Acquire an exclusive lock on ./data/<table>/LOCK.
+        // The lock is held for the lifetime of the Store and released automatically on drop.
+        let lock_path = Path::new(snapshot_path)
+            .parent()
+            .map(|p| p.join("LOCK"))
+            .unwrap_or_else(|| "LOCK".into());
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| AppError::IoError(e.to_string()))?;
+
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_EX: i32 = 2;
+            const LOCK_NB: i32 = 4;
+            let ret = unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            if ret != 0 {
+                return Err(AppError::IoError(format!(
+                    "table is already open: {}",
+                    lock_path.display()
+                )));
+            }
+        }
+
         let mut store = Store {
             data: BTreeMap::new(),
             wal: Wal::with_path(wal_path),
             sequence: 0,
             snapshot_path: snapshot_path.to_string(),
+            _lock: Some(lock_file),
         };
 
         if Path::new(snapshot_path).exists() {

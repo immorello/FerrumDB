@@ -3,17 +3,23 @@ use ferrumdb_core::wal::Wal;
 use std::fs;
 
 fn setup(name: &str) -> (String, String) {
-    fs::create_dir_all("data").ok();
-    let snapshot = format!("./data/test_{}_snapshot.pb", name);
-    let wal = format!("./data/test_{}_wal.log", name);
+    let dir = format!("./data/test_{}", name);
+    fs::create_dir_all(&dir).ok();
+    let snapshot = format!("{}/snapshot.pb", dir);
+    let wal      = format!("{}/wal.log", dir);
     let _ = fs::remove_file(&snapshot);
     let _ = fs::remove_file(&wal);
+    let _ = fs::remove_file(format!("{}/LOCK", dir));
     (snapshot, wal)
 }
 
 fn teardown(snapshot: &str, wal: &str) {
     let _ = fs::remove_file(snapshot);
     let _ = fs::remove_file(wal);
+    if let Some(parent) = std::path::Path::new(snapshot).parent() {
+        let _ = fs::remove_file(parent.join("LOCK"));
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 // --- WAL replay ---
