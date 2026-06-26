@@ -8,6 +8,7 @@ use std::os::unix::io::AsRawFd;
 use crate::errors::AppError;
 use crate::proto::value_message::Kind;
 use crate::proto::{Operation, ValueMessage};
+use crate::sstable::Entry;
 use crate::wal::{Wal, WAL_PATH};
 
 enum TxOp {
@@ -38,7 +39,9 @@ pub enum Value {
 
 #[derive(Debug)]
 pub struct Store {
-    data: BTreeMap<String, Value>,
+    // The memtable. Holds committed values and tombstones (deletion markers).
+    // A tombstone shadows any older value for the same key once SSTables exist.
+    data: BTreeMap<String, Entry>,
     wal: Wal,
     sequence: u64,
     pub(crate) snapshot_path: String,
@@ -57,11 +60,12 @@ impl Store {
         }
     }
 
-    pub fn get_data(&self) -> &BTreeMap<String, Value> {
+    pub fn get_data(&self) -> &BTreeMap<String, Entry> {
         &self.data
     }
 
     pub fn from_data(data: BTreeMap<String, Value>) -> Store {
+        let data = data.into_iter().map(|(k, v)| (k, Entry::Value(v))).collect();
         Store {
             data,
             wal: Wal::new(),
@@ -147,11 +151,11 @@ impl Store {
                             Operation::Put => {
                                 if let Some(value_msg) = &e.value {
                                     let value = Store::value_from_proto(value_msg)?;
-                                    store.data.insert(e.key.clone(), value);
+                                    store.data.insert(e.key.clone(), Entry::Value(value));
                                 }
                             }
                             Operation::Delete => {
-                                store.data.remove(&e.key);
+                                store.data.insert(e.key.clone(), Entry::Tombstone);
                             }
                             _ => {}
                         }
@@ -179,26 +183,30 @@ impl Store {
         let entry = Wal::create_put_entry(new_key.clone(), &new_value, self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
-        self.data.insert(new_key.clone(), new_value);
+        self.data.insert(new_key.clone(), Entry::Value(new_value));
         Ok(format!("Inserted value with key {}", new_key))
     }
 
-    pub fn get_value(&self, key: &str) -> Option<&Value> {
-        self.data.get(key)
+    /// Looks up a key. A tombstone (deleted key) resolves to `None`, the same as
+    /// a key that was never written. Returns an owned value because, once the
+    /// SSTable layer lands, the value may be read fresh from disk.
+    pub fn get_value(&self, key: &str) -> Result<Option<Value>, AppError> {
+        match self.data.get(key) {
+            Some(Entry::Value(v)) => Ok(Some(v.clone())),
+            Some(Entry::Tombstone) => Ok(None),
+            None => Ok(None),
+        }
     }
 
+    /// Deletes a key by writing a tombstone. Idempotent: deleting a key that does
+    /// not exist is not an error, because once SSTables exist a key's membership
+    /// cannot be checked without a disk read.
     pub fn delete_value(&mut self, key: &str) -> Result<String, AppError> {
-        if !self.data.contains_key(key) {
-            return Err(AppError::KeyNotFound(format!(
-                "Could not delete value with key {}",
-                key
-            )));
-        }
         self.sequence += 1;
         let entry = Wal::create_delete_entry(key.to_string(), self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
-        self.data.remove(key);
+        self.data.insert(key.to_string(), Entry::Tombstone);
         Ok(format!("Deleted value with key {}", key))
     }
 
@@ -216,7 +224,11 @@ impl Store {
         }
 
         let mut result = "Here's the complete list of items in the store:\n".to_string();
-        for (key, value) in &self.data {
+        for (key, entry) in &self.data {
+            let value = match entry {
+                Entry::Value(v) => v,
+                Entry::Tombstone => continue, // deleted key — not listed
+            };
             let line = match value {
                 Value::Integer(num) => format!("Value for item with key {}: {}\n", key, num),
                 Value::Float(num) => format!("Value for item with key {}: {}\n", key, num),
@@ -249,18 +261,11 @@ impl<'a> Transaction<'a> {
         self.ops.push(TxOp::Put(key, value));
     }
 
-    /// Returns an error if the key does not exist in the store at the time this
-    /// call is made. Note: keys inserted earlier in the same transaction are not
-    /// yet visible here — check existence before beginning the transaction if needed.
-    pub fn delete_value(&mut self, key: String) -> Result<(), AppError> {
-        if !self.store.data.contains_key(&key) {
-            return Err(AppError::KeyNotFound(format!(
-                "Could not delete value with key {}",
-                key
-            )));
-        }
+    /// Buffers a delete. Idempotent — deleting a key that does not exist is not
+    /// an error, matching `Store::delete_value`. The delete is applied as a
+    /// tombstone when the transaction commits.
+    pub fn delete_value(&mut self, key: String) {
         self.ops.push(TxOp::Delete(key));
-        Ok(())
     }
 
     /// Writes all buffered operations to the WAL, writes a COMMIT marker, fsyncs,
@@ -279,8 +284,8 @@ impl<'a> Transaction<'a> {
 
         for op in self.ops {
             match op {
-                TxOp::Put(k, v) => { self.store.data.insert(k, v); }
-                TxOp::Delete(k) => { self.store.data.remove(&k); }
+                TxOp::Put(k, v) => { self.store.data.insert(k, Entry::Value(v)); }
+                TxOp::Delete(k) => { self.store.data.insert(k, Entry::Tombstone); }
             }
         }
         Ok(())

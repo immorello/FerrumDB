@@ -38,9 +38,9 @@ fn test_wal_replay_on_open() {
     }
 
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("a"), Some(&Value::Integer(1)));
-    assert_eq!(store.get_value("b"), Some(&Value::Text("hello".to_string())));
-    assert_eq!(store.get_value("c"), Some(&Value::Boolean(true)));
+    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value("b").unwrap(), Some(Value::Text("hello".to_string())));
+    assert_eq!(store.get_value("c").unwrap(), Some(Value::Boolean(true)));
 
     teardown(&snap, &wal);
 }
@@ -57,8 +57,8 @@ fn test_delete_replayed_on_open() {
     }
 
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("keep"), Some(&Value::Integer(10)));
-    assert_eq!(store.get_value("drop"), None);
+    assert_eq!(store.get_value("keep").unwrap(), Some(Value::Integer(10)));
+    assert_eq!(store.get_value("drop").unwrap(), None);
 
     teardown(&snap, &wal);
 }
@@ -92,8 +92,8 @@ fn test_recovery_from_snapshot_after_checkpoint() {
     }
 
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("k1"), Some(&Value::Integer(1)));
-    assert_eq!(store.get_value("k2"), Some(&Value::Integer(2)));
+    assert_eq!(store.get_value("k1").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value("k2").unwrap(), Some(Value::Integer(2)));
 
     teardown(&snap, &wal);
 }
@@ -114,10 +114,10 @@ fn test_recovery_snapshot_plus_wal() {
     }
 
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("a"), Some(&Value::Integer(1)));
-    assert_eq!(store.get_value("b"), Some(&Value::Integer(2)));
-    assert_eq!(store.get_value("c"), Some(&Value::Integer(3)));
-    assert_eq!(store.get_value("d"), Some(&Value::Integer(4)));
+    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value("c").unwrap(), Some(Value::Integer(3)));
+    assert_eq!(store.get_value("d").unwrap(), Some(Value::Integer(4)));
 
     teardown(&snap, &wal);
 }
@@ -149,6 +149,56 @@ fn test_sequence_continues_after_open() {
         sequences.windows(2).all(|w| w[0] < w[1]),
         "sequences must be strictly increasing: {:?}",
         sequences
+    );
+
+    teardown(&snap, &wal);
+}
+
+// --- Tombstone correctness (Phase 2) ---
+
+// A key deleted after a checkpoint must NOT reappear after a later checkpoint.
+// This exercises store_to_proto_store dropping tombstones from the snapshot.
+#[test]
+fn test_deleted_key_dropped_from_snapshot() {
+    let (snap, wal) = setup("delete_dropped_from_snapshot");
+
+    {
+        let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+        store.set_value("x".to_string(), Value::Integer(5)).unwrap();
+        store.checkpoint().unwrap();      // snapshot: x = 5
+        store.delete_value("x").unwrap(); // memtable tombstone for x
+        store.checkpoint().unwrap();      // snapshot must now omit x entirely
+    }
+
+    let store = Store::open_with_paths(&snap, &wal).unwrap();
+    assert_eq!(
+        store.get_value("x").unwrap(),
+        None,
+        "a deleted key must not resurrect from the snapshot after checkpoint"
+    );
+
+    teardown(&snap, &wal);
+}
+
+// A delete recorded only in the WAL must shadow a value baked into the snapshot.
+// snapshot has x=5; WAL has a DELETE with no following checkpoint (a crash).
+#[test]
+fn test_wal_delete_shadows_snapshot_value() {
+    let (snap, wal) = setup("delete_shadows_snapshot");
+
+    {
+        let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+        store.set_value("x".to_string(), Value::Integer(5)).unwrap();
+        store.checkpoint().unwrap();      // snapshot: x = 5, WAL cleared
+        store.delete_value("x").unwrap(); // WAL: DELETE x (committed), no checkpoint
+        // Simulated crash.
+    }
+
+    let store = Store::open_with_paths(&snap, &wal).unwrap();
+    assert_eq!(
+        store.get_value("x").unwrap(),
+        None,
+        "a committed WAL delete must shadow the snapshot value on recovery"
     );
 
     teardown(&snap, &wal);

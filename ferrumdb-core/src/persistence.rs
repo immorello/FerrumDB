@@ -1,6 +1,7 @@
 use crate::errors::AppError;
 use crate::proto::value_message::Kind;
 use crate::proto::{StoreSnapshot, ValueMessage};
+use crate::sstable::Entry;
 use crate::store::{Store, Value};
 use prost::Message;
 use std::collections::BTreeMap;
@@ -37,10 +38,15 @@ impl Store {
     }
 
     pub(crate) fn store_to_proto_store(&self) -> StoreSnapshot {
+        // Tombstones are dropped from the snapshot: it represents the full state
+        // at checkpoint time, so a deleted key simply has nothing to record.
         let data = self
             .get_data()
             .iter()
-            .map(|(key, value)| (key.clone(), Store::value_to_proto(value)))
+            .filter_map(|(key, entry)| match entry {
+                Entry::Value(value) => Some((key.clone(), Store::value_to_proto(value))),
+                Entry::Tombstone => None,
+            })
             .collect();
         StoreSnapshot { data }
     }

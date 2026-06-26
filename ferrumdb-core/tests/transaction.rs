@@ -33,9 +33,9 @@ fn test_transaction_all_ops_visible_after_commit() {
     tx.set_value("c".to_string(), Value::Integer(3));
     tx.commit().unwrap();
 
-    assert_eq!(store.get_value("a"), Some(&Value::Integer(1)));
-    assert_eq!(store.get_value("b"), Some(&Value::Integer(2)));
-    assert_eq!(store.get_value("c"), Some(&Value::Integer(3)));
+    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value("c").unwrap(), Some(Value::Integer(3)));
 
     teardown(&snap, &wal);
 }
@@ -53,8 +53,8 @@ fn test_transaction_rollback_on_drop() {
         // Drop without commit — rollback.
     }
 
-    assert_eq!(store.get_value("existing"), Some(&Value::Integer(99)));
-    assert_eq!(store.get_value("new_key"), None);
+    assert_eq!(store.get_value("existing").unwrap(), Some(Value::Integer(99)));
+    assert_eq!(store.get_value("new_key").unwrap(), None);
 
     teardown(&snap, &wal);
 }
@@ -75,9 +75,9 @@ fn test_transaction_survives_recovery() {
     }
 
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("x"), Some(&Value::Integer(10)));
-    assert_eq!(store.get_value("y"), Some(&Value::Integer(20)));
-    assert_eq!(store.get_value("z"), Some(&Value::Integer(30)));
+    assert_eq!(store.get_value("x").unwrap(), Some(Value::Integer(10)));
+    assert_eq!(store.get_value("y").unwrap(), Some(Value::Integer(20)));
+    assert_eq!(store.get_value("z").unwrap(), Some(Value::Integer(30)));
 
     teardown(&snap, &wal);
 }
@@ -103,8 +103,8 @@ fn test_uncommitted_entries_discarded_on_recovery() {
     }
 
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("committed"), Some(&Value::Integer(1)));
-    assert_eq!(store.get_value("uncommitted"), None, "uncommitted entry must not survive recovery");
+    assert_eq!(store.get_value("committed").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value("uncommitted").unwrap(), None, "uncommitted entry must not survive recovery");
 
     teardown(&snap, &wal);
 }
@@ -119,12 +119,12 @@ fn test_transaction_mixed_ops() {
 
     let mut tx = store.begin_transaction();
     tx.set_value("new".to_string(), Value::Integer(42));
-    tx.delete_value("to_delete".to_string()).unwrap();
+    tx.delete_value("to_delete".to_string());
     tx.commit().unwrap();
 
-    assert_eq!(store.get_value("new"), Some(&Value::Integer(42)));
-    assert_eq!(store.get_value("to_delete"), None);
-    assert_eq!(store.get_value("to_keep"), Some(&Value::Text("hi".to_string())));
+    assert_eq!(store.get_value("new").unwrap(), Some(Value::Integer(42)));
+    assert_eq!(store.get_value("to_delete").unwrap(), None);
+    assert_eq!(store.get_value("to_keep").unwrap(), Some(Value::Text("hi".to_string())));
 
     teardown(&snap, &wal);
 }
@@ -145,7 +145,7 @@ fn test_sequential_transactions() {
 
     let store2 = Store::open_with_paths(&snap, &wal).unwrap();
     for i in 0..5i32 {
-        assert_eq!(store2.get_value(&format!("key_{}", i)), Some(&Value::Integer(i)));
+        assert_eq!(store2.get_value(&format!("key_{}", i)).unwrap(), Some(Value::Integer(i)));
     }
 
     teardown(&snap, &wal);

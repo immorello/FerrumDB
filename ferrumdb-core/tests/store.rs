@@ -82,12 +82,14 @@ fn test_set_get_delete() {
     let mut store = Store::open_with_paths(&snap, &wal).unwrap();
 
     store.set_value("key".to_string(), Value::Text("value".to_string())).unwrap();
-    assert_eq!(store.get_value("key"), Some(&Value::Text("value".to_string())));
+    assert_eq!(store.get_value("key").unwrap(), Some(Value::Text("value".to_string())));
 
     store.delete_value("key").unwrap();
-    assert_eq!(store.get_value("key"), None);
+    assert_eq!(store.get_value("key").unwrap(), None);
 
-    assert!(store.delete_value("key").is_err());
+    // Delete is idempotent: deleting an already-deleted key is not an error.
+    store.delete_value("key").unwrap();
+    assert_eq!(store.get_value("key").unwrap(), None);
 
     teardown(&snap, &wal);
 }
@@ -103,7 +105,7 @@ fn test_overwrite_keeps_sorted_order() {
 
     let keys: Vec<&String> = store.get_data().keys().collect();
     assert_eq!(keys, vec!["a", "b"]);
-    assert_eq!(store.get_value("b"), Some(&Value::Integer(99)));
+    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(99)));
 
     teardown(&snap, &wal);
 }

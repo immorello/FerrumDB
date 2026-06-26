@@ -52,7 +52,7 @@ fn test_lock_released_on_drop() {
 
     // Must succeed: lock is no longer held
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("k"), Some(&Value::Integer(1)));
+    assert_eq!(store.get_value("k").unwrap(), Some(Value::Integer(1)));
 
     teardown(&snap, &wal);
 }
@@ -69,8 +69,8 @@ fn test_different_tables_open_simultaneously() {
     store_a.set_value("key".to_string(), Value::Text("from_a".to_string())).unwrap();
     store_b.set_value("key".to_string(), Value::Text("from_b".to_string())).unwrap();
 
-    assert_eq!(store_a.get_value("key"), Some(&Value::Text("from_a".to_string())));
-    assert_eq!(store_b.get_value("key"), Some(&Value::Text("from_b".to_string())));
+    assert_eq!(store_a.get_value("key").unwrap(), Some(Value::Text("from_a".to_string())));
+    assert_eq!(store_b.get_value("key").unwrap(), Some(Value::Text("from_b".to_string())));
 
     teardown(&snap_a, &wal_a);
     teardown(&snap_b, &wal_b);
@@ -103,9 +103,9 @@ fn test_lock_reacquired_after_multiple_cycles() {
 
     // All three writes must be recoverable after three open/close cycles.
     let store = Store::open_with_paths(&snap, &wal).unwrap();
-    assert_eq!(store.get_value("key_0"), Some(&Value::Integer(0)));
-    assert_eq!(store.get_value("key_1"), Some(&Value::Integer(1)));
-    assert_eq!(store.get_value("key_2"), Some(&Value::Integer(2)));
+    assert_eq!(store.get_value("key_0").unwrap(), Some(Value::Integer(0)));
+    assert_eq!(store.get_value("key_1").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value("key_2").unwrap(), Some(Value::Integer(2)));
 
     teardown(&snap, &wal);
 }
