@@ -1,5 +1,4 @@
 pub mod errors;
-pub mod persistence;
 pub mod sstable;
 pub mod store;
 pub mod wal;

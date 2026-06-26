@@ -5,8 +5,8 @@ This document specifies the SSTable (Sorted String Table) format and read/write 
 **Implementation status:**
 - ✅ **Format + reader/writer** (`SsTable::flush` / `open` / `get`) — implemented, with per-block CRC32.
 - ✅ **Tombstones in the memtable** — `Store` holds `Entry` (value or tombstone); deletes write tombstones.
-- ⬜ **Flush wiring** — the memtable is not yet flushed to an SSTable by `Store` (the next step).
-- ⬜ **Multi-SSTable read path, compaction, bloom filters** — later steps.
+- ✅ **Flush wiring** — `Store::flush` writes the memtable to a new SSTable and clears the WAL; an automatic flush fires when the memtable exceeds a threshold. Reads consult the memtable, then SSTables newest→oldest. The snapshot mechanism has been replaced by flush.
+- ⬜ **Compaction, bloom filters** — later steps.
 
 The format is fixed deliberately and up front, because a file format is a forever decision: once FerrumDB writes `.sst` files to a device, the reader must be able to load them for the life of that data.
 
@@ -225,7 +225,6 @@ SSTables live alongside the other table files:
 
 ```
 ./data/users/
-  ├── snapshot.pb      (legacy snapshot — superseded by SSTables)
   ├── wal.log
   ├── LOCK
   ├── sstable_1.sst    ← oldest
@@ -233,7 +232,7 @@ SSTables live alongside the other table files:
   └── sstable_3.sst    ← newest
 ```
 
-The numeric id is a monotonic counter. **Higher id = newer**, which directly gives the newest-to-oldest read order. On `Store::open`, every `.sst` file is discovered, its footer and index loaded into RAM, and the set is ordered by id descending.
+The numeric id is a monotonic counter. **Higher id = newer**, which directly gives the newest-to-oldest read order. On `Store::open_with_dir`, every `.sst` file is discovered, its footer and index loaded into RAM, and the set is ordered by id descending.
 
 ---
 
@@ -249,8 +248,8 @@ These are deliberately left for later steps so the first SSTable implementation 
 
 ---
 
-## Open Decisions for the Flush-Wiring Step
+## Resolved Decisions
 
-1. **Flush trigger** — start with an explicit `Store::flush()` and/or a simple entry-count threshold, before doing byte-size accounting?
-2. **Snapshot vs SSTable** — does the existing `snapshot.pb` / `checkpoint()` path stay as a parallel mechanism, or is it fully replaced by SSTable flush? (Recommended: replace it, so there is one path to disk.)
-3. ~~**CRC scope**~~ — *resolved:* per-block CRC32 is implemented in version 1.
+1. **Flush trigger** — *resolved:* both. An explicit `Store::flush()` plus an automatic flush when the memtable passes `MEMTABLE_MAX_ENTRIES` (1024). A byte-based budget can replace the entry count later without changing callers.
+2. **Snapshot vs SSTable** — *resolved:* fully replaced. `snapshot.pb` / `persistence.rs` are gone; SSTable flush is the single path to disk.
+3. **CRC scope** — *resolved:* per-block CRC32 is implemented in version 1.

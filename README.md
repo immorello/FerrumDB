@@ -20,11 +20,11 @@ write
   ├─ WAL (append-only log, fsynced on commit)  ← durability + atomicity
   └─ BTreeMap memtable (sorted, in RAM)         ← fast access
        │
-       └─ flush when full                        ← [not yet implemented]
+       └─ flush when full
             │
             └─ SSTable (immutable sorted file on disk)
                  │
-                 └─ compaction (merge SSTables, reclaim space)
+                 └─ compaction (merge SSTables, reclaim space)  ← [not yet implemented]
 ```
 
 Reads check the memtable first, then SSTables from newest to oldest.
@@ -103,48 +103,53 @@ The write bottleneck is fsync latency, which is ~10-15ms on macOS APFS and ~1-5m
 
 Reads are pure in-memory and will change once the SSTable layer is in place — keys flushed out of the memtable will require disk access.
 
-### SSTable On-Disk Format
+### SSTable Layer
 
-The immutable on-disk file format is implemented (`ferrumdb-core/src/sstable.rs`): ~4 KB data blocks each protected by a CRC32, a sparse index (one entry per block), and a fixed footer carrying a magic number and format version. A reader loads only the footer and sparse index into RAM, then serves a point lookup with a single binary search and one block read. Tombstones are represented in the format. Full byte-level spec in [docs/sstable.md](docs/sstable.md).
+The memtable is flushed to immutable on-disk SSTables, which is what bounds memory on constrained devices. Each SSTable (`ferrumdb-core/src/sstable.rs`) is ~4 KB data blocks each protected by a CRC32, a sparse index (one entry per block), and a fixed footer carrying a magic number and format version. A reader loads only the footer and sparse index into RAM, then serves a point lookup with a single binary search and one block read. Full byte-level spec in [docs/sstable.md](docs/sstable.md).
 
-This is not yet wired into the write path — the memtable is not flushed to SSTables automatically. That is the next step (see Roadmap).
+- **Flush** — `Store::flush()` writes the whole memtable to a new SSTable, then clears the memtable and the WAL. An automatic flush fires once the memtable passes a threshold, so memory stays bounded.
+- **Layered reads** — a lookup checks the memtable first, then SSTables newest→oldest; the first hit wins. A tombstone in a newer layer shadows an older value.
+- **Crash safety** — the SSTable is fsynced before the WAL is cleared, so a crash in between is safe (the WAL entries simply replay on top of the SSTable).
+
+SSTable flush replaces the earlier snapshot mechanism as the single path to disk.
 
 ### Testing
 
-Integration tests cover seven areas:
+Integration tests cover eight areas:
 
 - `tests/wal.rs` — append, read-back, persistence across instances, clear
-- `tests/recovery.rs` — WAL replay on restart, delete replay, checkpoint, snapshot + WAL combined recovery, sequence continuity, tombstone correctness across checkpoint and recovery
-- `tests/store.rs` — sorted iteration, sorted order after WAL replay and checkpoint, set/get/delete correctness, idempotent delete, overwrite stability
+- `tests/recovery.rs` — WAL replay on restart, delete replay, flush clears WAL, recovery after flush, SSTable + WAL combined recovery, sequence continuity, tombstone shadowing across SSTables and from the WAL
+- `tests/store.rs` — sorted iteration, sorted order after WAL replay, data survives flush and recovery, set/get/delete correctness, idempotent delete, overwrite stability
 - `tests/lock.rs` — double-open rejection, lock release on drop, per-table isolation, LOCK file creation, multi-cycle reacquisition
 - `tests/transaction.rs` — commit visibility, rollback on drop, crash recovery of committed transactions, uncommitted entry discard, mixed put/delete transactions
 - `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table
-- `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, WAL replay time, checkpoint time
+- `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, auto-flush bounds the memtable
+- `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, WAL replay time, flush time
 
 ---
 
 ## Roadmap
 
-### Step 1 — SSTable layer (in progress)
+### Step 1 — SSTable layer ✅
 
-The memtable currently grows without bound. SSTable flush is what makes FerrumDB viable on memory-constrained embedded devices.
+SSTable flush is what makes FerrumDB viable on memory-constrained embedded devices, and it is now in place.
 
 - ✅ The immutable on-disk SSTable format (blocks, sparse index, CRC, footer) with a reader and writer.
 - ✅ Tombstones represented in the memtable and the format.
-- ⬜ A threshold on the memtable triggers a flush to a new SSTable on disk.
-- ⬜ Reads check the memtable first, then walk SSTables from newest to oldest.
-- ⬜ The flush path replaces `checkpoint()` as the normal mechanism for bounding WAL growth.
+- ✅ A threshold on the memtable triggers a flush to a new SSTable on disk.
+- ✅ Reads check the memtable first, then walk SSTables from newest to oldest.
+- ✅ Flush replaces the snapshot mechanism as the single path to disk.
 
 ### Step 2 — Buffer manager
 
-- Track memtable size in bytes.
-- Trigger SSTable flush automatically when the threshold is crossed.
-- Manage the list of live SSTable files and their key ranges.
+- Track memtable size in bytes rather than entry count.
+- Tune the flush threshold for the byte budget of the target device.
+- Manage the list of live SSTable files and their key ranges (e.g. skip an SSTable whose key range excludes the lookup).
 
 ### Step 3 — Compaction
 
-- When too many SSTables accumulate, reads degrade (more files to check per lookup).
-- Compaction merges SSTables into a single file, discarding deleted keys and old versions.
+- As SSTables accumulate, reads degrade (more files to check per lookup) and deleted keys are never reclaimed.
+- Compaction merges SSTables into fewer files, discarding tombstones and shadowed values.
 - A simple size-triggered strategy (merge all files when there are more than N) is the starting point.
 - Bloom filters can be added later to eliminate unnecessary SSTable reads for missing keys.
 

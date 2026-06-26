@@ -6,35 +6,26 @@ use ferrumdb_core::store::{Store, Value};
 use std::fs;
 use std::time::Instant;
 
+// Kept below the memtable flush threshold so these benchmarks measure the
+// memtable + WAL path without an incidental auto-flush skewing results.
 const N: usize = 1_000;
 
-fn setup(name: &str) -> (String, String) {
+fn setup(name: &str) -> String {
     let dir = format!("./data/perf_{}", name);
-    fs::create_dir_all(&dir).ok();
-    let snapshot = format!("{}/snapshot.pb", dir);
-    let wal      = format!("{}/wal.log", dir);
-    let _ = fs::remove_file(&snapshot);
-    let _ = fs::remove_file(&wal);
-    let _ = fs::remove_file(format!("{}/LOCK", dir));
-    (snapshot, wal)
+    let _ = fs::remove_dir_all(&dir);
+    dir
 }
 
-fn teardown(snapshot: &str, wal: &str) {
-    let _ = fs::remove_file(snapshot);
-    let _ = fs::remove_file(wal);
-    if let Some(parent) = std::path::Path::new(snapshot).parent() {
-        let _ = fs::remove_file(parent.join("LOCK"));
-        let _ = fs::remove_dir(parent);
-    }
+fn teardown(dir: &str) {
+    let _ = fs::remove_dir_all(dir);
 }
 
-// Sequential writes — one fsync per write, one file open/close per write.
-// This is the worst case: no batching, no buffering.
-// Expected bottleneck: fsync latency (~0.5–5ms per call on SSD).
+// Sequential writes — one fsync per write (append + COMMIT).
+// Expected bottleneck: fsync latency (~0.5–15ms per commit depending on storage).
 #[test]
 fn perf_sequential_write_throughput() {
-    let (snap, wal) = setup("write");
-    let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+    let dir = setup("write");
+    let mut store = Store::open_with_dir(&dir).unwrap();
 
     let start = Instant::now();
     for i in 0..N {
@@ -48,15 +39,14 @@ fn perf_sequential_write_throughput() {
         N, elapsed, ops_per_sec
     );
 
-    teardown(&snap, &wal);
+    teardown(&dir);
 }
 
-// Point reads from the in-memory BTreeMap — no disk access.
-// Expected: very fast, limited only by BTreeMap O(log n) lookup.
+// Point reads from the in-memory memtable — no disk access.
 #[test]
 fn perf_read_throughput() {
-    let (snap, wal) = setup("read");
-    let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+    let dir = setup("read");
+    let mut store = Store::open_with_dir(&dir).unwrap();
 
     for i in 0..N {
         store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
@@ -74,25 +64,24 @@ fn perf_read_throughput() {
         N, elapsed, ops_per_sec
     );
 
-    teardown(&snap, &wal);
+    teardown(&dir);
 }
 
-// WAL replay on open — simulates a crash recovery with N uncommitted entries.
-// Measures: protobuf decode + BTreeMap insert, times N.
+// WAL replay on open — simulates crash recovery with N committed entries.
 #[test]
 fn perf_wal_replay_on_open() {
-    let (snap, wal) = setup("replay");
+    let dir = setup("replay");
 
     {
-        let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+        let mut store = Store::open_with_dir(&dir).unwrap();
         for i in 0..N {
             store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
         }
-        // No checkpoint — all N entries remain in the WAL.
+        // No flush — all N entries remain in the WAL.
     }
 
     let start = Instant::now();
-    let store = Store::open_with_paths(&snap, &wal).unwrap();
+    let store = Store::open_with_dir(&dir).unwrap();
     let elapsed = start.elapsed();
 
     println!(
@@ -101,36 +90,36 @@ fn perf_wal_replay_on_open() {
         store.get_data().len() as f64 / elapsed.as_secs_f64()
     );
 
-    teardown(&snap, &wal);
+    teardown(&dir);
 }
 
-// Checkpoint — serialize BTreeMap to protobuf snapshot + fsync + WAL clear.
+// Flush — serialize the memtable to an SSTable (with CRCs) + fsync + WAL clear.
 #[test]
-fn perf_checkpoint() {
-    let (snap, wal) = setup("checkpoint");
-    let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+fn perf_flush() {
+    let dir = setup("flush");
+    let mut store = Store::open_with_dir(&dir).unwrap();
 
     for i in 0..N {
         store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
     }
 
     let start = Instant::now();
-    store.checkpoint().unwrap();
+    store.flush().unwrap();
     let elapsed = start.elapsed();
 
     println!(
-        "\n[checkpoint] {} entries  in {:>8.2?}  (snapshot write + WAL clear)",
+        "\n[flush]      {} entries  in {:>8.2?}  (SSTable write + WAL clear)",
         N, elapsed
     );
 
-    teardown(&snap, &wal);
+    teardown(&dir);
 }
 
 // Batched transaction — N writes, one fsync. Shows the real benefit of COMMIT.
 #[test]
 fn perf_batched_transaction() {
-    let (snap, wal) = setup("batch");
-    let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+    let dir = setup("batch");
+    let mut store = Store::open_with_dir(&dir).unwrap();
 
     let start = Instant::now();
     let mut tx = store.begin_transaction();
@@ -146,14 +135,14 @@ fn perf_batched_transaction() {
         N, elapsed, ops_per_sec
     );
 
-    teardown(&snap, &wal);
+    teardown(&dir);
 }
 
 // Mixed workload — alternating writes and reads, simulating real usage.
 #[test]
 fn perf_mixed_write_read() {
-    let (snap, wal) = setup("mixed");
-    let mut store = Store::open_with_paths(&snap, &wal).unwrap();
+    let dir = setup("mixed");
+    let mut store = Store::open_with_dir(&dir).unwrap();
 
     let start = Instant::now();
     for i in 0..N {
@@ -168,5 +157,5 @@ fn perf_mixed_write_read() {
         N * 2, elapsed, ops_per_sec
     );
 
-    teardown(&snap, &wal);
+    teardown(&dir);
 }

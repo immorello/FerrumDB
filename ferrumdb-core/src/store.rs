@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -8,8 +8,13 @@ use std::os::unix::io::AsRawFd;
 use crate::errors::AppError;
 use crate::proto::value_message::Kind;
 use crate::proto::{Operation, ValueMessage};
-use crate::sstable::Entry;
-use crate::wal::{Wal, WAL_PATH};
+use crate::sstable::{Entry, SsTable};
+use crate::wal::Wal;
+
+/// When the memtable reaches this many entries, it is flushed to a new SSTable.
+/// Keeping it a simple entry count (rather than a byte budget) is deliberate for
+/// a first cut; a byte-based budget can replace it later without changing callers.
+const MEMTABLE_MAX_ENTRIES: usize = 1024;
 
 enum TxOp {
     Put(String, Value),
@@ -27,8 +32,6 @@ pub struct Transaction<'a> {
     ops: Vec<TxOp>,
 }
 
-pub const STORAGE_PATH: &str = "./data/storage.pb";
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Integer(i32),
@@ -39,8 +42,8 @@ pub enum Value {
 
 impl Value {
     /// Encodes this value into its protobuf form. This is the single place a
-    /// `Value` becomes a `ValueMessage` — the WAL, the snapshot, and the SSTable
-    /// all go through here.
+    /// `Value` becomes a `ValueMessage` — the WAL and the SSTable both go
+    /// through here.
     pub(crate) fn to_proto(&self) -> ValueMessage {
         let kind = match self {
             Value::Integer(n) => Kind::Integer(*n),
@@ -65,68 +68,47 @@ impl Value {
     }
 }
 
+/// A single table. All of its files live under one directory:
+/// `wal.log`, `LOCK`, and `sstable_<id>.sst` files.
 #[derive(Debug)]
 pub struct Store {
     // The memtable. Holds committed values and tombstones (deletion markers).
-    // A tombstone shadows any older value for the same key once SSTables exist.
+    // A tombstone shadows any older value for the same key in the SSTables below.
     data: BTreeMap<String, Entry>,
     wal: Wal,
     sequence: u64,
-    pub(crate) snapshot_path: String,
+    dir: PathBuf,
+    // Immutable on-disk tables, ordered newest first (index 0 is the newest).
+    // Reads consult the memtable, then these in order.
+    sstables: Vec<SsTable>,
+    next_sstable_id: u64,
     // Held for its Drop — releasing it unlocks the table for other processes.
     _lock: Option<File>,
 }
 
-impl Default for Store {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Store {
-    pub fn new() -> Store {
-        Store {
-            data: BTreeMap::new(),
-            wal: Wal::new(),
-            sequence: 0,
-            snapshot_path: STORAGE_PATH.to_string(),
-            _lock: None,
-        }
-    }
-
+    /// Returns the in-memory portion of the table (the memtable). Data that has
+    /// been flushed to SSTables is not included.
     pub fn get_data(&self) -> &BTreeMap<String, Entry> {
         &self.data
     }
 
-    /// Opens a Store at the default paths, loading the last snapshot and replaying WAL entries.
-    /// This is the correct production entry point — use `new()` only for tests that want a blank slate.
-    pub fn open() -> Result<Store, AppError> {
-        Self::open_with_paths(STORAGE_PATH, WAL_PATH)
-    }
-
-    /// Opens a named table, storing all its files under ./data/<name>/.
+    /// Opens a named table, storing all its files under `./data/<name>/`.
     pub fn open_table(name: &str) -> Result<Store, AppError> {
-        let snapshot = format!("./data/{}/snapshot.pb", name);
-        let wal      = format!("./data/{}/wal.log", name);
-        Self::open_with_paths(&snapshot, &wal)
+        Self::open_with_dir(&format!("./data/{}", name))
     }
 
-    /// Opens a Store at custom paths. Use in tests to avoid file-level conflicts between test cases.
-    pub fn open_with_paths(snapshot_path: &str, wal_path: &str) -> Result<Store, AppError> {
-        // Ensure the table directory exists before acquiring the lock.
-        if let Some(parent) = Path::new(snapshot_path).parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| AppError::IoError(e.to_string()))?;
-        }
+    /// Opens a table rooted at `dir`, acquiring an exclusive lock, loading any
+    /// existing SSTables, and replaying the WAL on top. Use a unique `dir` per
+    /// table; tests use this directly for isolation.
+    pub fn open_with_dir(dir: &str) -> Result<Store, AppError> {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).map_err(|e| AppError::IoError(e.to_string()))?;
 
-        // Acquire an exclusive lock on ./data/<table>/LOCK.
-        // The lock is held for the lifetime of the Store and released automatically on drop.
-        let lock_path = Path::new(snapshot_path)
-            .parent()
-            .map(|p| p.join("LOCK"))
-            .unwrap_or_else(|| "LOCK".into());
-
-        let lock_file = std::fs::OpenOptions::new()
+        // Acquire an exclusive lock on <dir>/LOCK, held for the lifetime of the
+        // Store and released automatically on drop.
+        let lock_path = dir.join("LOCK");
+        let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false) // the lock file is a marker; never truncate it
@@ -149,56 +131,105 @@ impl Store {
             }
         }
 
+        let wal = Wal::with_path(dir.join("wal.log").to_string_lossy().into_owned());
         let mut store = Store {
             data: BTreeMap::new(),
-            wal: Wal::with_path(wal_path),
+            wal,
             sequence: 0,
-            snapshot_path: snapshot_path.to_string(),
+            dir,
+            sstables: Vec::new(),
+            next_sstable_id: 1,
             _lock: Some(lock_file),
         };
 
-        if Path::new(snapshot_path).exists() {
-            store.data = store.load_from_file()?;
+        store.load_sstables()?;
+        store.replay_wal()?;
+
+        Ok(store)
+    }
+
+    /// Discovers `sstable_<id>.sst` files in the table directory, opens each
+    /// (loading its sparse index into RAM), and orders them newest first.
+    fn load_sstables(&mut self) -> Result<(), AppError> {
+        let read_dir = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(_) => return Ok(()), // nothing to load
+        };
+
+        let mut found: Vec<(u64, SsTable)> = Vec::new();
+        for entry in read_dir {
+            let path = entry.map_err(|e| AppError::IoError(e.to_string()))?.path();
+            if let Some(id) = sstable_id_from_path(&path) {
+                found.push((id, SsTable::open(&path)?));
+            }
         }
 
-        let entries = store.wal.read_all()?;
+        // Highest id is newest; the next id to assign is one past the max.
+        self.next_sstable_id = found.iter().map(|(id, _)| *id + 1).max().unwrap_or(1);
+        found.sort_by_key(|(id, _)| std::cmp::Reverse(*id)); // newest first
+        self.sstables = found.into_iter().map(|(_, sst)| sst).collect();
+        Ok(())
+    }
+
+    /// Replays committed WAL entries on top of the current memtable. Entries
+    /// after the last COMMIT are discarded (uncommitted when the process died).
+    fn replay_wal(&mut self) -> Result<(), AppError> {
+        let entries = self.wal.read_all()?;
         let mut pending: Vec<crate::proto::WalEntry> = Vec::new();
+
         for entry in entries {
             match entry.operation() {
-                Operation::Put | Operation::Delete => {
-                    pending.push(entry);
-                }
+                Operation::Put | Operation::Delete => pending.push(entry),
                 Operation::Commit => {
                     for e in &pending {
                         match e.operation() {
                             Operation::Put => {
                                 if let Some(value_msg) = &e.value {
                                     let value = Value::from_proto(value_msg)?;
-                                    store.data.insert(e.key.clone(), Entry::Value(value));
+                                    self.data.insert(e.key.clone(), Entry::Value(value));
                                 }
                             }
                             Operation::Delete => {
-                                store.data.insert(e.key.clone(), Entry::Tombstone);
+                                self.data.insert(e.key.clone(), Entry::Tombstone);
                             }
                             _ => {}
                         }
-                        store.sequence = store.sequence.max(e.sequence);
+                        self.sequence = self.sequence.max(e.sequence);
                     }
-                    store.sequence = store.sequence.max(entry.sequence);
+                    self.sequence = self.sequence.max(entry.sequence);
                     pending.clear();
                 }
             }
         }
-        // Entries in `pending` have no following COMMIT — discarded (uncommitted at crash time).
-
-        Ok(store)
+        Ok(())
     }
 
-    /// Writes the current state as a snapshot and clears the WAL.
-    /// After a checkpoint, WAL replay on the next open starts from an empty log.
-    pub fn checkpoint(&mut self) -> Result<(), AppError> {
-        self.save_to_file()?;
-        self.wal.clear()
+    /// Writes the whole memtable out as a new immutable SSTable, then clears the
+    /// memtable and truncates the WAL. The SSTable is fsynced before the WAL is
+    /// cleared: a crash in between leaves the SSTable complete and the WAL still
+    /// holding the same entries, which replay harmlessly on top.
+    pub fn flush(&mut self) -> Result<(), AppError> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+
+        let id = self.next_sstable_id;
+        let path = self.dir.join(format!("sstable_{}.sst", id));
+        let sst = SsTable::flush(&path, self.data.iter())?;
+        self.next_sstable_id += 1;
+
+        self.sstables.insert(0, sst); // newest at the front
+        self.data.clear();
+        self.wal.clear()?;
+        Ok(())
+    }
+
+    /// Flushes if the memtable has grown past the threshold.
+    fn maybe_flush(&mut self) -> Result<(), AppError> {
+        if self.data.len() >= MEMTABLE_MAX_ENTRIES {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     pub fn set_value(&mut self, new_key: String, new_value: Value) -> Result<String, AppError> {
@@ -207,29 +238,41 @@ impl Store {
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
         self.data.insert(new_key.clone(), Entry::Value(new_value));
+        self.maybe_flush()?;
         Ok(format!("Inserted value with key {}", new_key))
     }
 
-    /// Looks up a key. A tombstone (deleted key) resolves to `None`, the same as
-    /// a key that was never written. Returns an owned value because, once the
-    /// SSTable layer lands, the value may be read fresh from disk.
+    /// Looks up a key. Checks the memtable first, then SSTables from newest to
+    /// oldest; the first source that has the key wins. A tombstone resolves to
+    /// `None`, the same as a key that was never written.
     pub fn get_value(&self, key: &str) -> Result<Option<Value>, AppError> {
         match self.data.get(key) {
-            Some(Entry::Value(v)) => Ok(Some(v.clone())),
-            Some(Entry::Tombstone) => Ok(None),
-            None => Ok(None),
+            Some(Entry::Value(v)) => return Ok(Some(v.clone())),
+            Some(Entry::Tombstone) => return Ok(None),
+            None => {}
         }
+
+        for sst in &self.sstables {
+            match sst.get(key)? {
+                Some(Entry::Value(v)) => return Ok(Some(v)),
+                Some(Entry::Tombstone) => return Ok(None),
+                None => {}
+            }
+        }
+
+        Ok(None)
     }
 
     /// Deletes a key by writing a tombstone. Idempotent: deleting a key that does
-    /// not exist is not an error, because once SSTables exist a key's membership
-    /// cannot be checked without a disk read.
+    /// not exist is not an error, because the key may live in an SSTable whose
+    /// membership cannot be checked without a disk read.
     pub fn delete_value(&mut self, key: &str) -> Result<String, AppError> {
         self.sequence += 1;
         let entry = Wal::create_delete_entry(key.to_string(), self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
         self.data.insert(key.to_string(), Entry::Tombstone);
+        self.maybe_flush()?;
         Ok(format!("Deleted value with key {}", key))
     }
 
@@ -240,31 +283,13 @@ impl Store {
     pub fn begin_transaction(&mut self) -> Transaction<'_> {
         Transaction { store: self, ops: Vec::new() }
     }
+}
 
-    pub fn list_values(&self) -> Result<String, AppError> {
-        if self.data.is_empty() {
-            return Err(AppError::InternalError("Store is empty".to_string()));
-        }
-
-        let mut result = "Here's the complete list of items in the store:\n".to_string();
-        for (key, entry) in &self.data {
-            let value = match entry {
-                Entry::Value(v) => v,
-                Entry::Tombstone => continue, // deleted key — not listed
-            };
-            let line = match value {
-                Value::Integer(num) => format!("Value for item with key {}: {}\n", key, num),
-                Value::Float(num) => format!("Value for item with key {}: {}\n", key, num),
-                Value::Text(txt) => format!("Value for item with key {}: {}\n", key, txt),
-                Value::Boolean(boolean) => {
-                    format!("Value for item with key {}: {}\n", key, boolean)
-                }
-            };
-            result.push_str(&line);
-        }
-
-        Ok(result)
-    }
+/// Parses the SSTable id out of a `.../sstable_<id>.sst` path, or `None` if the
+/// file name does not match that pattern.
+fn sstable_id_from_path(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("sstable_")?.strip_suffix(".sst")?.parse::<u64>().ok()
 }
 
 impl<'a> Transaction<'a> {
@@ -280,7 +305,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Writes all buffered operations to the WAL, writes a COMMIT marker, fsyncs,
-    /// then applies every operation to the in-memory BTreeMap.
+    /// then applies every operation to the in-memory memtable.
     /// A single fsync covers the entire batch.
     pub fn commit(self) -> Result<(), AppError> {
         for op in &self.ops {
@@ -299,6 +324,7 @@ impl<'a> Transaction<'a> {
                 TxOp::Delete(k) => { self.store.data.insert(k, Entry::Tombstone); }
             }
         }
+        self.store.maybe_flush()?;
         Ok(())
     }
 }
