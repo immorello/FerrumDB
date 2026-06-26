@@ -37,6 +37,34 @@ pub enum Value {
     Boolean(bool),
 }
 
+impl Value {
+    /// Encodes this value into its protobuf form. This is the single place a
+    /// `Value` becomes a `ValueMessage` — the WAL, the snapshot, and the SSTable
+    /// all go through here.
+    pub(crate) fn to_proto(&self) -> ValueMessage {
+        let kind = match self {
+            Value::Integer(n) => Kind::Integer(*n),
+            Value::Float(n) => Kind::Float(*n),
+            Value::Text(s) => Kind::Text(s.clone()),
+            Value::Boolean(b) => Kind::Boolean(*b),
+        };
+        ValueMessage { kind: Some(kind) }
+    }
+
+    /// Decodes a value from its protobuf form. The inverse of [`Value::to_proto`].
+    pub(crate) fn from_proto(msg: &ValueMessage) -> Result<Value, AppError> {
+        match msg.kind.as_ref() {
+            Some(Kind::Integer(n)) => Ok(Value::Integer(*n)),
+            Some(Kind::Float(n)) => Ok(Value::Float(*n)),
+            Some(Kind::Text(s)) => Ok(Value::Text(s.clone())),
+            Some(Kind::Boolean(b)) => Ok(Value::Boolean(*b)),
+            None => Err(AppError::DecodeError(
+                "value message has no kind set".to_string(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Store {
     // The memtable. Holds committed values and tombstones (deletion markers).
@@ -47,6 +75,12 @@ pub struct Store {
     pub(crate) snapshot_path: String,
     // Held for its Drop — releasing it unlocks the table for other processes.
     _lock: Option<File>,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Store {
@@ -62,17 +96,6 @@ impl Store {
 
     pub fn get_data(&self) -> &BTreeMap<String, Entry> {
         &self.data
-    }
-
-    pub fn from_data(data: BTreeMap<String, Value>) -> Store {
-        let data = data.into_iter().map(|(k, v)| (k, Entry::Value(v))).collect();
-        Store {
-            data,
-            wal: Wal::new(),
-            sequence: 0,
-            snapshot_path: STORAGE_PATH.to_string(),
-            _lock: None,
-        }
     }
 
     /// Opens a Store at the default paths, loading the last snapshot and replaying WAL entries.
@@ -106,6 +129,7 @@ impl Store {
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false) // the lock file is a marker; never truncate it
             .open(&lock_path)
             .map_err(|e| AppError::IoError(e.to_string()))?;
 
@@ -134,8 +158,7 @@ impl Store {
         };
 
         if Path::new(snapshot_path).exists() {
-            let snapshot = store.load_from_file()?;
-            store.data = snapshot.data;
+            store.data = store.load_from_file()?;
         }
 
         let entries = store.wal.read_all()?;
@@ -150,7 +173,7 @@ impl Store {
                         match e.operation() {
                             Operation::Put => {
                                 if let Some(value_msg) = &e.value {
-                                    let value = Store::value_from_proto(value_msg)?;
+                                    let value = Value::from_proto(value_msg)?;
                                     store.data.insert(e.key.clone(), Entry::Value(value));
                                 }
                             }
@@ -174,7 +197,7 @@ impl Store {
     /// Writes the current state as a snapshot and clears the WAL.
     /// After a checkpoint, WAL replay on the next open starts from an empty log.
     pub fn checkpoint(&mut self) -> Result<(), AppError> {
-        self.save_to_file().map_err(AppError::IoError)?;
+        self.save_to_file()?;
         self.wal.clear()
     }
 
@@ -241,18 +264,6 @@ impl Store {
         }
 
         Ok(result)
-    }
-
-    pub(crate) fn value_from_proto(msg: &ValueMessage) -> Result<Value, AppError> {
-        match msg.kind.as_ref() {
-            Some(Kind::Integer(n)) => Ok(Value::Integer(*n)),
-            Some(Kind::Float(n)) => Ok(Value::Float(*n)),
-            Some(Kind::Text(s)) => Ok(Value::Text(s.clone())),
-            Some(Kind::Boolean(b)) => Ok(Value::Boolean(*b)),
-            None => Err(AppError::DecodeError(
-                "WAL entry has unknown value type".to_string(),
-            )),
-        }
     }
 }
 

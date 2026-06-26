@@ -26,7 +26,7 @@ fn test_flush_and_read_roundtrip() {
     let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
     mem.insert("a".to_string(), Entry::Value(Value::Integer(1)));
     mem.insert("b".to_string(), Entry::Value(Value::Text("hello".to_string())));
-    mem.insert("c".to_string(), Entry::Value(Value::Float(3.14)));
+    mem.insert("c".to_string(), Entry::Value(Value::Float(2.5)));
     mem.insert("d".to_string(), Entry::Value(Value::Boolean(true)));
 
     SsTable::flush(&path, mem.iter()).unwrap();
@@ -35,7 +35,7 @@ fn test_flush_and_read_roundtrip() {
     let sst = SsTable::open(&path).unwrap();
     assert_eq!(sst.get("a").unwrap(), Some(Entry::Value(Value::Integer(1))));
     assert_eq!(sst.get("b").unwrap(), Some(Entry::Value(Value::Text("hello".to_string()))));
-    assert_eq!(sst.get("c").unwrap(), Some(Entry::Value(Value::Float(3.14))));
+    assert_eq!(sst.get("c").unwrap(), Some(Entry::Value(Value::Float(2.5))));
     assert_eq!(sst.get("d").unwrap(), Some(Entry::Value(Value::Boolean(true))));
 
     teardown(&path);

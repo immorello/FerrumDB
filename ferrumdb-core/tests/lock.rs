@@ -98,7 +98,7 @@ fn test_lock_reacquired_after_multiple_cycles() {
     for i in 0..3 {
         let mut store = Store::open_with_paths(&snap, &wal)
             .unwrap_or_else(|e| panic!("cycle {} failed to open: {e:?}", i));
-        store.set_value(format!("key_{}", i), Value::Integer(i as i32)).unwrap();
+        store.set_value(format!("key_{}", i), Value::Integer(i)).unwrap();
     }
 
     // All three writes must be recoverable after three open/close cycles.

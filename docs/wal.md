@@ -1,6 +1,6 @@
 # WAL Module — Current State
 
-This document describes the Write-Ahead Log as it exists today: its file format, its Rust API, how it integrates with the Store, and what it does and does not guarantee. It is meant as a reference for reasoning about the next changes (COMMIT markers, write lock).
+This document describes the Write-Ahead Log as it exists today: its file format, its Rust API, how it integrates with the Store, and what it does and does not guarantee. COMMIT markers and the write lock, once future work, are now implemented and described here.
 
 ---
 
@@ -47,6 +47,7 @@ Defined in `ferrumdb-core/src/proto/wal.proto`:
 enum Operation {
   PUT    = 0;
   DELETE = 1;
+  COMMIT = 2;
 }
 
 message WalEntry {
@@ -73,7 +74,7 @@ message ValueMessage {
 
 ### Field notes
 
-- **operation** — `PUT` or `DELETE`. `PUT` requires a `value`. `DELETE` leaves `value` empty.
+- **operation** — `PUT`, `DELETE`, or `COMMIT`. `PUT` requires a `value`. `DELETE` and `COMMIT` leave `value` empty. A `COMMIT` entry marks the end of a transaction; entries not followed by a `COMMIT` are discarded on replay.
 - **key** — the store key as a UTF-8 string.
 - **sequence** — a monotonically increasing counter assigned by `Store`, not by `Wal`. The WAL itself does not validate or assign sequence numbers. After recovery, `Store` sets its counter to the highest sequence seen so new writes never reuse old numbers.
 - **timestamp** — exists in the schema but is always written as `0`. Currently unused.
@@ -110,9 +111,17 @@ Both constructors call `create_dir_all` on the parent directory so the first `ap
 pub fn append(&self, entry: &WalEntry) -> Result<(), AppError>
 ```
 
-Opens the file in append mode, writes the length prefix followed by the protobuf payload, calls `flush` and then `sync_all`. The file is closed after every call.
+Opens the file in append mode, writes the length prefix followed by the protobuf payload, and calls `flush`. **It does not fsync.** A bare `append` is therefore not durable on its own — it must be followed by `write_commit`, which fsyncs the whole batch at once.
 
-The double call (`flush` then `sync_all`) is intentional: `flush` drains the userspace buffer, `sync_all` issues an `fsync` to push data from the OS page cache to the physical medium.
+This split is what makes transactions cheap: N operations are appended, then a single `write_commit` pays one fsync for all of them.
+
+### `write_commit`
+
+```rust
+pub fn write_commit(&self, sequence: u64) -> Result<(), AppError>
+```
+
+Appends a `COMMIT` entry and then calls `flush` followed by `sync_all`. The `sync_all` issues the `fsync` that makes every preceding `append` since the last commit durable. On replay, any entries written after the last `COMMIT` are discarded — they were uncommitted when the process crashed.
 
 **The file is reopened on every call.** This is correct but expensive for high write rates. It is a known limitation.
 
@@ -167,28 +176,31 @@ The `Store` struct owns a `Wal` instance and a `sequence: u64` counter.
 
 ### Write path
 
-Every mutation goes through the WAL before touching the in-memory `BTreeMap`:
+Every mutation goes through the WAL before touching the in-memory `BTreeMap`. A single `set_value`/`delete_value` is implicitly its own one-operation transaction: append, then commit.
 
 ```
 set_value("price", 19.99)
   │
-  ├─ increment sequence  (sequence = N)
-  ├─ build WalEntry      (PUT, "price", 19.99, N)
-  ├─ wal.append(entry)   ← fsync happens here
-  └─ data.insert(...)    ← only after WAL succeeds
+  ├─ increment sequence    (sequence = N)
+  ├─ build WalEntry        (PUT, "price", 19.99, N)
+  ├─ wal.append(entry)     ← buffered, NOT yet durable
+  ├─ wal.write_commit(N)   ← COMMIT entry + fsync (durable here)
+  └─ data.insert(...)      ← Entry::Value, only after WAL succeeds
 ```
 
-If `wal.append` fails, the `BTreeMap` is not touched. The write either lands in both or in neither.
+A delete is the same shape, but inserts a tombstone instead of a value, and is idempotent (deleting a missing key is not an error):
 
 ```
 delete_value("price")
   │
-  ├─ check key exists    ← returns KeyNotFound if missing
-  ├─ increment sequence  (sequence = N)
-  ├─ build WalEntry      (DELETE, "price", N)
-  ├─ wal.append(entry)   ← fsync happens here
-  └─ data.remove(...)    ← only after WAL succeeds
+  ├─ increment sequence    (sequence = N)
+  ├─ build WalEntry        (DELETE, "price", N)
+  ├─ wal.append(entry)     ← buffered
+  ├─ wal.write_commit(N)   ← COMMIT + fsync
+  └─ data.insert(Tombstone) ← shadows any older value
 ```
+
+An explicit multi-operation `Transaction` appends every buffered op, then calls `write_commit` once — one fsync for the whole batch. If the `BTreeMap` update is reached, the WAL write already succeeded; the write lands in both or in neither.
 
 ### Recovery path (`Store::open`)
 
@@ -196,20 +208,22 @@ delete_value("price")
 open_with_paths(snapshot_path, wal_path)
   │
   ├─ if snapshot exists → load_from_file()
-  │     reads protobuf snapshot into BTreeMap
+  │     reads protobuf snapshot into the memtable (all as Entry::Value)
   │
   ├─ wal.read_all()
   │     returns all entries in write order
   │
-  ├─ for each entry:
-  │     PUT    → data.insert(key, value)
-  │     DELETE → data.remove(key)
+  ├─ buffer PUT/DELETE entries until a COMMIT is seen, then apply the batch:
+  │     PUT    → data.insert(key, Entry::Value(value))
+  │     DELETE → data.insert(key, Entry::Tombstone)
   │     update sequence to max(sequence, entry.sequence)
+  │
+  ├─ entries after the last COMMIT are discarded (uncommitted at crash time)
   │
   └─ return Store with recovered state
 ```
 
-All WAL entries are replayed unconditionally on top of the snapshot. This is safe because WAL entries written before the last checkpoint are already baked into the snapshot — the checkpoint always clears the WAL immediately after writing the snapshot.
+Committed WAL entries are replayed on top of the snapshot. This is safe because entries written before the last checkpoint are already baked into the snapshot — the checkpoint clears the WAL immediately after writing the snapshot.
 
 ### Checkpoint path
 
@@ -242,8 +256,8 @@ use ferrumdb_core::store::{Store, Value};
 // Second run — WAL replay restores both keys
 {
     let store = Store::open_with_paths("./data/snap.pb", "./data/wal.log").unwrap();
-    assert_eq!(store.get_value("city"), Some(&Value::Text("Rome".to_string())));
-    assert_eq!(store.get_value("population"), Some(&Value::Integer(2_873_000)));
+    assert_eq!(store.get_value("city").unwrap(), Some(Value::Text("Rome".to_string())));
+    assert_eq!(store.get_value("population").unwrap(), Some(Value::Integer(2_873_000)));
 }
 ```
 
@@ -281,30 +295,17 @@ for entry in &entries {
 
 ## What the WAL Does Not Currently Do
 
-### No multi-operation atomicity
-
-Every `set_value` and `delete_value` is immediately fsynced as its own WAL entry. There is no way to group multiple operations so that either all of them land or none of them do. Example:
-
-```rust
-store.set_value("balance_a".to_string(), Value::Integer(900)).unwrap();
-// crash here
-store.set_value("balance_b".to_string(), Value::Integer(100)).unwrap();
-```
-
-After recovery, only `balance_a` is updated. The two writes are not atomic.
-
-To fix this, the WAL needs a `COMMIT` marker. The write path would become: buffer entries in memory → write all entries to WAL → write COMMIT entry → fsync once → apply to BTreeMap. The replay path would discard any entries not followed by a COMMIT.
-
-### No write lock
-
-Nothing prevents two processes from opening the same store directory simultaneously. Both would write to the same WAL file, interleaving entries with potentially conflicting sequence numbers, and produce a corrupt store.
-
-The fix is a lockfile (`./data/LOCK`) acquired exclusively when `Store::open` is called and released when the `Store` is dropped.
-
 ### No checksum per entry
 
-Bit-flip corruption inside a valid-length record is not detected. A CRC32 written as part of the frame header (before or after the length prefix) would catch this.
+Bit-flip corruption inside a valid-length record is not detected. A CRC32 written as part of the frame header (before or after the length prefix) would catch this. The SSTable format already does this per block (see `docs/sstable.md`); the WAL does not yet.
 
 ### File reopened on every append
 
-The WAL file is opened, written, and closed on each `append` call. For high write rates this is expensive. The fix is to hold the file open for the lifetime of the `Wal` instance and use `&mut self` on `append`.
+The WAL file is opened, written, and closed on each `append` and `write_commit` call. For high write rates this is expensive — it is the main reason a batched transaction is only a few times faster than N single writes rather than orders of magnitude. The fix is to hold the file open for the lifetime of the `Wal` instance.
+
+---
+
+## What the WAL Now Does (previously listed as missing)
+
+- **Multi-operation atomicity** — via the `COMMIT` marker. `append` no longer fsyncs; `write_commit` writes a COMMIT entry and fsyncs once for the whole batch. On replay, entries not followed by a COMMIT are discarded. See the write and recovery paths above.
+- **Write lock** — `Store::open_with_paths` acquires an exclusive `flock` on `./data/<table>/LOCK`, held for the lifetime of the `Store` and released on drop. A second open of the same table fails immediately.

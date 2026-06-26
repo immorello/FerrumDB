@@ -1,6 +1,12 @@
 # SSTable Module — Design Spec
 
-This document specifies the SSTable (Sorted String Table) format and read/write paths **before they are built**. Unlike `docs/wal.md`, which describes code that exists, this is a contract to implement against. When the implementation lands, this document should be updated to "current state" the way the WAL doc is.
+This document specifies the SSTable (Sorted String Table) format and read/write paths. It began as a contract to implement against; the on-disk format and its reader/writer now exist in `ferrumdb-core/src/sstable.rs`.
+
+**Implementation status:**
+- ✅ **Format + reader/writer** (`SsTable::flush` / `open` / `get`) — implemented, with per-block CRC32.
+- ✅ **Tombstones in the memtable** — `Store` holds `Entry` (value or tombstone); deletes write tombstones.
+- ⬜ **Flush wiring** — the memtable is not yet flushed to an SSTable by `Store` (the next step).
+- ⬜ **Multi-SSTable read path, compaction, bloom filters** — later steps.
 
 The format is fixed deliberately and up front, because a file format is a forever decision: once FerrumDB writes `.sst` files to a device, the reader must be able to load them for the life of that data.
 
@@ -243,8 +249,8 @@ These are deliberately left for later steps so the first SSTable implementation 
 
 ---
 
-## Open Decisions to Confirm Before Coding
+## Open Decisions for the Flush-Wiring Step
 
 1. **Flush trigger** — start with an explicit `Store::flush()` and/or a simple entry-count threshold, before doing byte-size accounting?
 2. **Snapshot vs SSTable** — does the existing `snapshot.pb` / `checkpoint()` path stay as a parallel mechanism, or is it fully replaced by SSTable flush? (Recommended: replace it, so there is one path to disk.)
-3. **CRC scope** — confirm per-block CRC32 in version 1 (recommended) rather than deferring it.
+3. ~~**CRC scope**~~ — *resolved:* per-block CRC32 is implemented in version 1.

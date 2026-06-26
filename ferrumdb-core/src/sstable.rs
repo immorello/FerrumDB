@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use prost::Message;
 
 use crate::errors::AppError;
-use crate::proto::value_message::Kind;
 use crate::proto::ValueMessage;
 use crate::store::Value;
 
@@ -225,7 +224,7 @@ impl SsTable {
                 if rec_key == key {
                     let msg = ValueMessage::decode(val_bytes)
                         .map_err(|e| AppError::DecodeError(e.to_string()))?;
-                    return Ok(Some(Entry::Value(proto_to_value(&msg)?)));
+                    return Ok(Some(Entry::Value(Value::from_proto(&msg)?)));
                 }
             } else {
                 // Tombstone — val_len is 0, no value bytes.
@@ -262,7 +261,7 @@ fn encode_record(out: &mut Vec<u8>, key: &str, entry: &Entry) {
     match entry {
         Entry::Value(v) => {
             out.push(TYPE_VALUE);
-            let bytes = value_to_proto(v).encode_to_vec();
+            let bytes = v.to_proto().encode_to_vec();
             write_u32(out, bytes.len() as u32);
             out.extend_from_slice(&bytes);
         }
@@ -338,28 +337,6 @@ fn read_bytes<'a>(buf: &'a [u8], c: &mut usize, len: usize) -> Result<&'a [u8], 
 fn read_string(buf: &[u8], c: &mut usize, len: usize) -> Result<String, AppError> {
     let bytes = read_bytes(buf, c, len)?;
     String::from_utf8(bytes.to_vec()).map_err(|e| AppError::DecodeError(e.to_string()))
-}
-
-// --- typed value <-> protobuf (mirrors store::value_from_proto) ---
-
-fn value_to_proto(v: &Value) -> ValueMessage {
-    let kind = match v {
-        Value::Integer(n) => Kind::Integer(*n),
-        Value::Float(n) => Kind::Float(*n),
-        Value::Text(s) => Kind::Text(s.clone()),
-        Value::Boolean(b) => Kind::Boolean(*b),
-    };
-    ValueMessage { kind: Some(kind) }
-}
-
-fn proto_to_value(msg: &ValueMessage) -> Result<Value, AppError> {
-    match msg.kind.as_ref() {
-        Some(Kind::Integer(n)) => Ok(Value::Integer(*n)),
-        Some(Kind::Float(n)) => Ok(Value::Float(*n)),
-        Some(Kind::Text(s)) => Ok(Value::Text(s.clone())),
-        Some(Kind::Boolean(b)) => Ok(Value::Boolean(*b)),
-        None => Err(AppError::DecodeError("SSTable value has unknown type".to_string())),
-    }
 }
 
 // --- CRC32 (IEEE 802.3, polynomial 0xEDB88320) ---

@@ -103,29 +103,37 @@ The write bottleneck is fsync latency, which is ~10-15ms on macOS APFS and ~1-5m
 
 Reads are pure in-memory and will change once the SSTable layer is in place — keys flushed out of the memtable will require disk access.
 
+### SSTable On-Disk Format
+
+The immutable on-disk file format is implemented (`ferrumdb-core/src/sstable.rs`): ~4 KB data blocks each protected by a CRC32, a sparse index (one entry per block), and a fixed footer carrying a magic number and format version. A reader loads only the footer and sparse index into RAM, then serves a point lookup with a single binary search and one block read. Tombstones are represented in the format. Full byte-level spec in [docs/sstable.md](docs/sstable.md).
+
+This is not yet wired into the write path — the memtable is not flushed to SSTables automatically. That is the next step (see Roadmap).
+
 ### Testing
 
-Integration tests cover six areas:
+Integration tests cover seven areas:
 
 - `tests/wal.rs` — append, read-back, persistence across instances, clear
-- `tests/recovery.rs` — WAL replay on restart, delete replay, checkpoint clears WAL, snapshot-only recovery, snapshot + WAL combined recovery, sequence continuity across restarts
-- `tests/store.rs` — sorted iteration, sorted order after WAL replay and checkpoint, set/get/delete correctness, overwrite stability
+- `tests/recovery.rs` — WAL replay on restart, delete replay, checkpoint, snapshot + WAL combined recovery, sequence continuity, tombstone correctness across checkpoint and recovery
+- `tests/store.rs` — sorted iteration, sorted order after WAL replay and checkpoint, set/get/delete correctness, idempotent delete, overwrite stability
 - `tests/lock.rs` — double-open rejection, lock release on drop, per-table isolation, LOCK file creation, multi-cycle reacquisition
 - `tests/transaction.rs` — commit visibility, rollback on drop, crash recovery of committed transactions, uncommitted entry discard, mixed put/delete transactions
+- `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table
 - `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, WAL replay time, checkpoint time
 
 ---
 
 ## Roadmap
 
-### Step 1 — SSTable layer (next)
+### Step 1 — SSTable layer (in progress)
 
 The memtable currently grows without bound. SSTable flush is what makes FerrumDB viable on memory-constrained embedded devices.
 
-- A size threshold on the memtable triggers a flush to an immutable sorted file on disk.
-- The SSTable file format is a binary sorted sequence of key-value records, written once and never modified.
-- Reads check the memtable first, then walk SSTables from newest to oldest.
-- The flush path replaces `checkpoint()` as the normal mechanism for bounding WAL growth.
+- ✅ The immutable on-disk SSTable format (blocks, sparse index, CRC, footer) with a reader and writer.
+- ✅ Tombstones represented in the memtable and the format.
+- ⬜ A threshold on the memtable triggers a flush to a new SSTable on disk.
+- ⬜ Reads check the memtable first, then walk SSTables from newest to oldest.
+- ⬜ The flush path replaces `checkpoint()` as the normal mechanism for bounding WAL growth.
 
 ### Step 2 — Buffer manager
 

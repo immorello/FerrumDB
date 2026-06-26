@@ -144,7 +144,7 @@ fn test_wal_clear() {
     wal.clear().expect("Failed to clear");
     
     // Verify it's empty
-    assert!(wal.read_all().expect("Failed to read").len() == 0);
+    assert!(wal.read_all().expect("Failed to read").is_empty());
     
     // Clean up
     fs::remove_file(test_path).ok();

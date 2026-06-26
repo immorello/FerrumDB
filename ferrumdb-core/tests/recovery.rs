@@ -70,7 +70,7 @@ fn test_checkpoint_clears_wal() {
     let (snap, wal) = setup("checkpoint_clears_wal");
 
     let mut store = Store::open_with_paths(&snap, &wal).unwrap();
-    store.set_value("x".to_string(), Value::Float(3.14)).unwrap();
+    store.set_value("x".to_string(), Value::Float(2.5)).unwrap();
     store.checkpoint().unwrap();
 
     let wal_entries = Wal::with_path(&wal).read_all().unwrap();

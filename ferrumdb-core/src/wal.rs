@@ -7,8 +7,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::errors::AppError;
-use crate::proto::value_message::Kind;
-use crate::proto::{Operation, ValueMessage, WalEntry};
+use crate::proto::{Operation, WalEntry};
 use prost::Message;
 
 /// Default path for the WAL log file
@@ -177,25 +176,10 @@ impl Wal {
 impl Wal {
     /// Creates a PUT entry for storing a value
     pub fn create_put_entry(key: String, value: &crate::store::Value, sequence: u64) -> WalEntry {
-        let value_msg = match value {
-            crate::store::Value::Integer(n) => ValueMessage {
-                kind: Some(Kind::Integer(*n)),
-            },
-            crate::store::Value::Float(n) => ValueMessage {
-                kind: Some(Kind::Float(*n)),
-            },
-            crate::store::Value::Text(s) => ValueMessage {
-                kind: Some(Kind::Text(s.clone())),
-            },
-            crate::store::Value::Boolean(b) => ValueMessage {
-                kind: Some(Kind::Boolean(*b)),
-            },
-        };
-
         WalEntry {
             operation: Operation::Put.into(),
             key,
-            value: Some(value_msg),
+            value: Some(value.to_proto()),
             sequence,
             timestamp: 0, // Can be set by caller if needed
         }
