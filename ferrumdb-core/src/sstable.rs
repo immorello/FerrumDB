@@ -33,7 +33,9 @@ const BLOCK_SIZE: usize = 4096;
 const MAGIC: &[u8; 4] = b"FSST";
 
 /// Current SSTable format version.
-const VERSION: u32 = 1;
+/// v2 appends the table's min and max key after the sparse index, so a point
+/// lookup can skip a table whose key range cannot contain the key.
+const VERSION: u32 = 2;
 
 /// Fixed footer size: index_offset(8) + index_len(8) + entry_count(4) + magic(4) + version(4).
 const FOOTER_LEN: usize = 28;
@@ -62,6 +64,10 @@ struct IndexEntry {
 pub struct SsTable {
     path: PathBuf,
     index: Vec<IndexEntry>,
+    // Smallest and largest key in the table. `None` only for an empty table.
+    // Used to skip the table entirely when a lookup key falls outside its range.
+    min_key: Option<String>,
+    max_key: Option<String>,
 }
 
 impl SsTable {
@@ -84,7 +90,17 @@ impl SsTable {
         let mut block_first_key: Option<String> = None;
         let mut block_offset: u64 = 0;
 
+        // Track the table-wide key range. Keys arrive in ascending order, so the
+        // first key seen is the min and the last is the max.
+        let mut min_key: Option<String> = None;
+        let mut max_key: Option<String> = None;
+
         for (key, entry) in entries {
+            if min_key.is_none() {
+                min_key = Some(key.clone());
+            }
+            max_key = Some(key.clone());
+
             if block.is_empty() {
                 block_first_key = Some(key.clone());
                 block_offset = file.len() as u64;
@@ -100,13 +116,20 @@ impl SsTable {
             finalize_block(&mut file, &mut block, &mut index, block_first_key.take(), block_offset);
         }
 
-        // Index region.
+        // Index region: the sparse index entries, then the table key range.
         let index_offset = file.len() as u64;
         for e in &index {
             write_u32(&mut file, e.first_key.len() as u32);
             file.extend_from_slice(e.first_key.as_bytes());
             file.extend_from_slice(&e.block_offset.to_be_bytes());
             write_u32(&mut file, e.block_len);
+        }
+        // Key range, only present for a non-empty table (min and max are Some together).
+        if let (Some(min), Some(max)) = (&min_key, &max_key) {
+            write_u32(&mut file, min.len() as u32);
+            file.extend_from_slice(min.as_bytes());
+            write_u32(&mut file, max.len() as u32);
+            file.extend_from_slice(max.as_bytes());
         }
         let index_len = file.len() as u64 - index_offset;
 
@@ -127,7 +150,7 @@ impl SsTable {
         f.write_all(&file).map_err(|e| AppError::IoError(e.to_string()))?;
         f.sync_all().map_err(|e| AppError::IoError(e.to_string()))?;
 
-        Ok(SsTable { path: path.to_path_buf(), index })
+        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key })
     }
 
     /// Opens an existing SSTable: reads the footer, validates it, and loads the
@@ -175,7 +198,18 @@ impl SsTable {
             index.push(IndexEntry { first_key, block_offset, block_len });
         }
 
-        Ok(SsTable { path: path.to_path_buf(), index })
+        // Key range follows the index entries (absent for an empty table).
+        let (min_key, max_key) = if c < buf.len() {
+            let min_len = read_u32(&buf, &mut c)? as usize;
+            let min = read_string(&buf, &mut c, min_len)?;
+            let max_len = read_u32(&buf, &mut c)? as usize;
+            let max = read_string(&buf, &mut c, max_len)?;
+            (Some(min), Some(max))
+        } else {
+            (None, None)
+        };
+
+        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key })
     }
 
     /// Looks up a key. Returns `None` if the key is not present in this table.
@@ -183,6 +217,13 @@ impl SsTable {
     /// whether that shadows older tables.
     pub fn get(&self, key: &str) -> Result<Option<Entry>, AppError> {
         if self.index.is_empty() {
+            return Ok(None);
+        }
+
+        // Skip the whole table if the key falls outside its range — no disk read.
+        if let (Some(min), Some(max)) = (&self.min_key, &self.max_key)
+            && (key < min.as_str() || key > max.as_str())
+        {
             return Ok(None);
         }
 
@@ -245,6 +286,14 @@ impl SsTable {
     /// Number of data blocks (= sparse index entries). Useful for tests.
     pub fn block_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// The table's `(min_key, max_key)` range, or `None` if the table is empty.
+    pub fn key_range(&self) -> Option<(&str, &str)> {
+        match (&self.min_key, &self.max_key) {
+            (Some(min), Some(max)) => Some((min.as_str(), max.as_str())),
+            _ => None,
+        }
     }
 
     /// Path to the underlying file.

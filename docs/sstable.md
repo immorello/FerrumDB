@@ -3,9 +3,10 @@
 This document specifies the SSTable (Sorted String Table) format and read/write paths. It began as a contract to implement against; the on-disk format and its reader/writer now exist in `ferrumdb-core/src/sstable.rs`.
 
 **Implementation status:**
-- ✅ **Format + reader/writer** (`SsTable::flush` / `open` / `get`) — implemented, with per-block CRC32.
+- ✅ **Format + reader/writer** (`SsTable::flush` / `open` / `get`) — implemented, with per-block CRC32. Format version 2 also persists each table's key range.
 - ✅ **Tombstones in the memtable** — `Store` holds `Entry` (value or tombstone); deletes write tombstones.
 - ✅ **Flush wiring** — `Store::flush` writes the memtable to a new SSTable and clears the WAL; an automatic flush fires when the memtable exceeds a threshold. Reads consult the memtable, then SSTables newest→oldest. The snapshot mechanism has been replaced by flush.
+- ✅ **Buffer manager** — the flush threshold is a **byte budget** (memtable live size), tunable per table via `Store::set_memtable_budget`, not an entry count. Each SSTable stores its min/max key so a point lookup **skips** any table whose range cannot contain the key.
 - ⬜ **Compaction, bloom filters** — later steps.
 
 The format is fixed deliberately and up front, because a file format is a forever decision: once FerrumDB writes `.sst` files to a device, the reader must be able to load them for the life of that data.
@@ -62,6 +63,7 @@ An SSTable file has three regions, written in this order:
 ├──────────────────────────────────────────────┤
 │ INDEX REGION                                   │
 │   sparse index: one entry per data block       │
+│   key range: min_key, max_key  (v2)            │
 ├──────────────────────────────────────────────┤
 │ FOOTER  (fixed 28 bytes)                        │
 │   index_offset · index_len · entry_count       │
@@ -136,6 +138,19 @@ Each index entry:
 
 Index entries appear in ascending key order, so a lookup is a binary search.
 
+### Key range (format v2)
+
+Immediately after the index entries, a non-empty table stores its overall key range:
+
+```
+┌────────────┬───────────┬────────────┬───────────┐
+│ min_key_len│ min_key   │ max_key_len│ max_key   │
+│ u32        │ len B     │ u32        │ len B     │
+└────────────┴───────────┴────────────┴───────────┘
+```
+
+This lives inside the index region (it is covered by `index_len`), so the reader loads it in the same read as the index. With it, a point lookup whose key is `< min_key` or `> max_key` returns immediately without touching a data block — the table is skipped. An empty table writes no key range.
+
 ---
 
 ## Footer Format
@@ -153,7 +168,7 @@ The footer is a fixed **28 bytes** at the very end of the file:
 - **index_len** — byte length of the index region.
 - **entry_count** — number of index entries (= number of data blocks).
 - **magic** — the ASCII bytes `FSST` (`0x46 0x53 0x53 0x54`). Confirms the file really is a FerrumDB SSTable before any other byte is trusted.
-- **version** — format version, currently `1`. A version-2 reader can branch on this to still load version-1 files.
+- **version** — format version, currently `2` (v2 added the key range after the index). A reader rejects a version it does not recognize.
 
 Because the footer is fixed-size and last, the reader's first action is `seek(file_size - 28)`, read 28 bytes, check magic and version, then use `index_offset`/`index_len` to load the index.
 
@@ -250,6 +265,6 @@ These are deliberately left for later steps so the first SSTable implementation 
 
 ## Resolved Decisions
 
-1. **Flush trigger** — *resolved:* both. An explicit `Store::flush()` plus an automatic flush when the memtable passes `MEMTABLE_MAX_ENTRIES` (1024). A byte-based budget can replace the entry count later without changing callers.
+1. **Flush trigger** — *resolved:* both. An explicit `Store::flush()` plus an automatic flush when the memtable's live size passes a **byte budget** (`DEFAULT_MEMTABLE_MAX_BYTES`, 1 MiB), tunable per table via `Store::set_memtable_budget`.
 2. **Snapshot vs SSTable** — *resolved:* fully replaced. `snapshot.pb` / `persistence.rs` are gone; SSTable flush is the single path to disk.
-3. **CRC scope** — *resolved:* per-block CRC32 is implemented in version 1.
+3. **CRC scope** — *resolved:* per-block CRC32 is implemented (format v1+).

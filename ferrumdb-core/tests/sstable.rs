@@ -132,6 +132,43 @@ fn test_empty_sstable() {
     let sst = SsTable::open(&path).unwrap();
     assert_eq!(sst.block_count(), 0);
     assert_eq!(sst.get("anything").unwrap(), None);
+    assert_eq!(sst.key_range(), None, "an empty table has no key range");
+
+    teardown(&path);
+}
+
+// The persisted key range is the smallest and largest key, and survives reopen.
+#[test]
+fn test_key_range_reports_min_and_max() {
+    let path = setup("key_range");
+
+    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    mem.insert("d".to_string(), Entry::Value(Value::Integer(4)));
+    mem.insert("a".to_string(), Entry::Value(Value::Integer(1)));
+    mem.insert("q".to_string(), Entry::Value(Value::Integer(17)));
+    SsTable::flush(&path, mem.iter()).unwrap();
+
+    let sst = SsTable::open(&path).unwrap();
+    assert_eq!(sst.key_range(), Some(("a", "q")));
+
+    teardown(&path);
+}
+
+// A key outside the table's range is reported absent (the table is skipped).
+#[test]
+fn test_out_of_range_key_skipped() {
+    let path = setup("out_of_range");
+
+    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    for k in ["m", "n", "o", "p"] {
+        mem.insert(k.to_string(), Entry::Value(Value::Integer(1)));
+    }
+    SsTable::flush(&path, mem.iter()).unwrap();
+
+    let sst = SsTable::open(&path).unwrap();
+    assert_eq!(sst.get("a").unwrap(), None, "key before the range");
+    assert_eq!(sst.get("z").unwrap(), None, "key after the range");
+    assert_eq!(sst.get("n").unwrap(), Some(Entry::Value(Value::Integer(1))));
 
     teardown(&path);
 }

@@ -113,34 +113,38 @@ fn test_layered_read_across_many_sstables() {
     teardown(&dir);
 }
 
-// Exceeding the memtable threshold triggers an automatic flush, bounding memory.
-// The writes go through a single transaction so the test does not pay one fsync
-// per entry.
+// Exceeding the memtable byte budget triggers automatic flushes, so the memtable
+// stays bounded no matter how much is written. A tiny budget is set so the test
+// is fast and deterministic.
 #[test]
 fn test_auto_flush_bounds_memtable() {
     let dir = setup("auto_flush");
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        let mut tx = store.begin_transaction();
-        for i in 0..1100 {
-            tx.set_value(format!("key_{:04}", i), Value::Integer(i));
+        store.set_memtable_budget(64); // bytes — tiny, forces frequent flushes
+        for i in 0..50 {
+            store.set_value(format!("key_{:03}", i), Value::Integer(i)).unwrap();
         }
-        tx.commit().unwrap(); // commit applies all ops, then auto-flush triggers
 
+        assert!(count_sstables(&dir) >= 1, "small budget must trigger auto-flush");
         assert!(
-            store.get_data().is_empty(),
-            "memtable must be flushed once it exceeds the threshold"
+            store.get_data().len() < 50,
+            "the memtable must hold far fewer than all entries — memory is bounded"
         );
-        assert!(count_sstables(&dir) >= 1, "an auto-flush should have written an SSTable");
         assert!(Path::new(&dir).join("wal.log").exists());
     }
 
-    // Everything is still readable after reopen, served from the SSTable.
+    // Everything is still readable after reopen, served from the SSTables.
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("key_0000").unwrap(), Some(Value::Integer(0)));
-    assert_eq!(store.get_value("key_0550").unwrap(), Some(Value::Integer(550)));
-    assert_eq!(store.get_value("key_1099").unwrap(), Some(Value::Integer(1099)));
+    for i in 0..50 {
+        assert_eq!(
+            store.get_value(&format!("key_{:03}", i)).unwrap(),
+            Some(Value::Integer(i)),
+            "key_{:03} must survive auto-flush and recovery",
+            i
+        );
+    }
 
     teardown(&dir);
 }

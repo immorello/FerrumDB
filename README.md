@@ -107,8 +107,8 @@ Reads are pure in-memory and will change once the SSTable layer is in place — 
 
 The memtable is flushed to immutable on-disk SSTables, which is what bounds memory on constrained devices. Each SSTable (`ferrumdb-core/src/sstable.rs`) is ~4 KB data blocks each protected by a CRC32, a sparse index (one entry per block), and a fixed footer carrying a magic number and format version. A reader loads only the footer and sparse index into RAM, then serves a point lookup with a single binary search and one block read. Full byte-level spec in [docs/sstable.md](docs/sstable.md).
 
-- **Flush** — `Store::flush()` writes the whole memtable to a new SSTable, then clears the memtable and the WAL. An automatic flush fires once the memtable passes a threshold, so memory stays bounded.
-- **Layered reads** — a lookup checks the memtable first, then SSTables newest→oldest; the first hit wins. A tombstone in a newer layer shadows an older value.
+- **Flush** — `Store::flush()` writes the whole memtable to a new SSTable, then clears the memtable and the WAL. An automatic flush fires once the memtable's live size passes a **byte budget** (tunable per table via `set_memtable_budget`), so memory stays bounded regardless of how much is written.
+- **Layered reads** — a lookup checks the memtable first, then SSTables newest→oldest; the first hit wins. A tombstone in a newer layer shadows an older value. Each SSTable records its **key range**, so a lookup skips any table that cannot contain the key without touching the disk.
 - **Crash safety** — the SSTable is fsynced before the WAL is cleared, so a crash in between is safe (the WAL entries simply replay on top of the SSTable).
 
 SSTable flush replaces the earlier snapshot mechanism as the single path to disk.
@@ -122,8 +122,8 @@ Integration tests cover eight areas:
 - `tests/store.rs` — sorted iteration, sorted order after WAL replay, data survives flush and recovery, set/get/delete correctness, idempotent delete, overwrite stability
 - `tests/lock.rs` — double-open rejection, lock release on drop, per-table isolation, LOCK file creation, multi-cycle reacquisition
 - `tests/transaction.rs` — commit visibility, rollback on drop, crash recovery of committed transactions, uncommitted entry discard, mixed put/delete transactions
-- `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table
-- `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, auto-flush bounds the memtable
+- `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table, key-range reporting and out-of-range skip
+- `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, byte-budget auto-flush bounds the memtable
 - `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, WAL replay time, flush time
 
 ---
@@ -140,11 +140,11 @@ SSTable flush is what makes FerrumDB viable on memory-constrained embedded devic
 - ✅ Reads check the memtable first, then walk SSTables from newest to oldest.
 - ✅ Flush replaces the snapshot mechanism as the single path to disk.
 
-### Step 2 — Buffer manager
+### Step 2 — Buffer manager ✅
 
-- Track memtable size in bytes rather than entry count.
-- Tune the flush threshold for the byte budget of the target device.
-- Manage the list of live SSTable files and their key ranges (e.g. skip an SSTable whose key range excludes the lookup).
+- ✅ Track memtable size in bytes rather than entry count.
+- ✅ The flush byte budget is tunable per table (`set_memtable_budget`) for the target device.
+- ✅ Each SSTable records its key range; a lookup skips any SSTable whose range excludes the key, with no disk read.
 
 ### Step 3 — Compaction
 

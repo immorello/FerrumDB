@@ -11,10 +11,11 @@ use crate::proto::{Operation, ValueMessage};
 use crate::sstable::{Entry, SsTable};
 use crate::wal::Wal;
 
-/// When the memtable reaches this many entries, it is flushed to a new SSTable.
-/// Keeping it a simple entry count (rather than a byte budget) is deliberate for
-/// a first cut; a byte-based budget can replace it later without changing callers.
-const MEMTABLE_MAX_ENTRIES: usize = 1024;
+/// Default memtable budget: once the live data in the memtable reaches this many
+/// bytes, it is flushed to a new SSTable. Sized as a budget rather than an entry
+/// count so the threshold tracks actual memory use. Tunable per table via
+/// [`Store::set_memtable_budget`] to match the target device.
+const DEFAULT_MEMTABLE_MAX_BYTES: usize = 1 << 20; // 1 MiB
 
 enum TxOp {
     Put(String, Value),
@@ -75,6 +76,10 @@ pub struct Store {
     // The memtable. Holds committed values and tombstones (deletion markers).
     // A tombstone shadows any older value for the same key in the SSTables below.
     data: BTreeMap<String, Entry>,
+    // Running estimate of the memtable's live data size in bytes (keys + values).
+    // Drives the flush decision; kept in sync by `memtable_insert`.
+    memtable_bytes: usize,
+    memtable_max_bytes: usize,
     wal: Wal,
     sequence: u64,
     dir: PathBuf,
@@ -91,6 +96,22 @@ impl Store {
     /// been flushed to SSTables is not included.
     pub fn get_data(&self) -> &BTreeMap<String, Entry> {
         &self.data
+    }
+
+    /// Sets the memtable byte budget that triggers an automatic flush. Intended
+    /// to be called right after opening, to match the target device's memory.
+    pub fn set_memtable_budget(&mut self, bytes: usize) {
+        self.memtable_max_bytes = bytes;
+    }
+
+    /// Inserts into the memtable, keeping the byte estimate in sync. Replacing an
+    /// existing key subtracts the old footprint before adding the new one.
+    fn memtable_insert(&mut self, key: String, entry: Entry) {
+        self.memtable_bytes += entry_footprint(&key, &entry);
+        if let Some(old) = self.data.get(&key) {
+            self.memtable_bytes -= entry_footprint(&key, old);
+        }
+        self.data.insert(key, entry);
     }
 
     /// Opens a named table, storing all its files under `./data/<name>/`.
@@ -134,6 +155,8 @@ impl Store {
         let wal = Wal::with_path(dir.join("wal.log").to_string_lossy().into_owned());
         let mut store = Store {
             data: BTreeMap::new(),
+            memtable_bytes: 0,
+            memtable_max_bytes: DEFAULT_MEMTABLE_MAX_BYTES,
             wal,
             sequence: 0,
             dir,
@@ -186,11 +209,11 @@ impl Store {
                             Operation::Put => {
                                 if let Some(value_msg) = &e.value {
                                     let value = Value::from_proto(value_msg)?;
-                                    self.data.insert(e.key.clone(), Entry::Value(value));
+                                    self.memtable_insert(e.key.clone(), Entry::Value(value));
                                 }
                             }
                             Operation::Delete => {
-                                self.data.insert(e.key.clone(), Entry::Tombstone);
+                                self.memtable_insert(e.key.clone(), Entry::Tombstone);
                             }
                             _ => {}
                         }
@@ -220,13 +243,14 @@ impl Store {
 
         self.sstables.insert(0, sst); // newest at the front
         self.data.clear();
+        self.memtable_bytes = 0;
         self.wal.clear()?;
         Ok(())
     }
 
-    /// Flushes if the memtable has grown past the threshold.
+    /// Flushes if the memtable's byte estimate has reached the budget.
     fn maybe_flush(&mut self) -> Result<(), AppError> {
-        if self.data.len() >= MEMTABLE_MAX_ENTRIES {
+        if self.memtable_bytes >= self.memtable_max_bytes {
             self.flush()?;
         }
         Ok(())
@@ -237,7 +261,7 @@ impl Store {
         let entry = Wal::create_put_entry(new_key.clone(), &new_value, self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
-        self.data.insert(new_key.clone(), Entry::Value(new_value));
+        self.memtable_insert(new_key.clone(), Entry::Value(new_value));
         self.maybe_flush()?;
         Ok(format!("Inserted value with key {}", new_key))
     }
@@ -271,7 +295,7 @@ impl Store {
         let entry = Wal::create_delete_entry(key.to_string(), self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
-        self.data.insert(key.to_string(), Entry::Tombstone);
+        self.memtable_insert(key.to_string(), Entry::Tombstone);
         self.maybe_flush()?;
         Ok(format!("Deleted value with key {}", key))
     }
@@ -290,6 +314,19 @@ impl Store {
 fn sstable_id_from_path(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
     name.strip_prefix("sstable_")?.strip_suffix(".sst")?.parse::<u64>().ok()
+}
+
+/// Approximate in-memory footprint of one memtable entry: the key bytes plus the
+/// value bytes. Used only to drive the flush budget, so an estimate is fine.
+fn entry_footprint(key: &str, entry: &Entry) -> usize {
+    let value_bytes = match entry {
+        Entry::Value(Value::Integer(_)) => 4,
+        Entry::Value(Value::Float(_)) => 8,
+        Entry::Value(Value::Boolean(_)) => 1,
+        Entry::Value(Value::Text(s)) => s.len(),
+        Entry::Tombstone => 0,
+    };
+    key.len() + value_bytes
 }
 
 impl<'a> Transaction<'a> {
@@ -320,8 +357,8 @@ impl<'a> Transaction<'a> {
 
         for op in self.ops {
             match op {
-                TxOp::Put(k, v) => { self.store.data.insert(k, Entry::Value(v)); }
-                TxOp::Delete(k) => { self.store.data.insert(k, Entry::Tombstone); }
+                TxOp::Put(k, v) => self.store.memtable_insert(k, Entry::Value(v)),
+                TxOp::Delete(k) => self.store.memtable_insert(k, Entry::Tombstone),
             }
         }
         self.store.maybe_flush()?;
