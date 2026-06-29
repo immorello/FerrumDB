@@ -15,7 +15,12 @@ use crate::wal::Wal;
 /// bytes, it is flushed to a new SSTable. Sized as a budget rather than an entry
 /// count so the threshold tracks actual memory use. Tunable per table via
 /// [`Store::set_memtable_budget`] to match the target device.
-const DEFAULT_MEMTABLE_MAX_BYTES: usize = 1 << 20; // 1 MiB
+const DEFAULT_MEMTABLE_MAX_BYTES: usize = 4 << 20; // 4 MiB
+
+/// Once the number of SSTables exceeds this, they are compacted into one. A higher
+/// value means fewer compactions (less write amplification) but more files to
+/// consult per lookup; the per-SSTable key range keeps that cost low.
+const MAX_SSTABLES: usize = 8;
 
 enum TxOp {
     Put(String, Value),
@@ -245,6 +250,8 @@ impl Store {
         self.data.clear();
         self.memtable_bytes = 0;
         self.wal.clear()?;
+
+        self.maybe_compact()?;
         Ok(())
     }
 
@@ -252,6 +259,54 @@ impl Store {
     fn maybe_flush(&mut self) -> Result<(), AppError> {
         if self.memtable_bytes >= self.memtable_max_bytes {
             self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Compacts if too many SSTables have accumulated.
+    fn maybe_compact(&mut self) -> Result<(), AppError> {
+        if self.sstables.len() > MAX_SSTABLES {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Merges all SSTables into a single new one, keeping only the newest value
+    /// per key and dropping tombstones (a full merge leaves nothing older for a
+    /// tombstone to shadow). The merged table is fsynced before the old files are
+    /// removed, so a crash in between is safe: the stale tables simply replay
+    /// behind the newer merged table and lose to it on every read.
+    pub fn compact(&mut self) -> Result<(), AppError> {
+        if self.sstables.len() < 2 {
+            return Ok(()); // nothing worth merging
+        }
+
+        // Merge oldest -> newest so a newer entry overwrites an older one.
+        let mut merged: BTreeMap<String, Entry> = BTreeMap::new();
+        for sst in self.sstables.iter().rev() {
+            for (key, entry) in sst.read_all_entries()? {
+                merged.insert(key, entry);
+            }
+        }
+        // Full merge: a tombstone has nothing older left to shadow, so drop it.
+        merged.retain(|_, entry| matches!(entry, Entry::Value(_)));
+
+        let old_paths: Vec<PathBuf> = self.sstables.iter().map(|s| s.path().to_path_buf()).collect();
+
+        if merged.is_empty() {
+            // Everything was deleted — no new table needed.
+            self.sstables.clear();
+        } else {
+            let id = self.next_sstable_id;
+            let path = self.dir.join(format!("sstable_{}.sst", id));
+            let new_sst = SsTable::flush(&path, merged.iter())?;
+            self.next_sstable_id += 1;
+            self.sstables = vec![new_sst];
+        }
+
+        // Best-effort cleanup of the now-obsolete files (safe to leave if it fails).
+        for path in old_paths {
+            let _ = std::fs::remove_file(path);
         }
         Ok(())
     }

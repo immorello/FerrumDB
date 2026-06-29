@@ -7,7 +7,8 @@ This document specifies the SSTable (Sorted String Table) format and read/write 
 - ✅ **Tombstones in the memtable** — `Store` holds `Entry` (value or tombstone); deletes write tombstones.
 - ✅ **Flush wiring** — `Store::flush` writes the memtable to a new SSTable and clears the WAL; an automatic flush fires when the memtable exceeds a threshold. Reads consult the memtable, then SSTables newest→oldest. The snapshot mechanism has been replaced by flush.
 - ✅ **Buffer manager** — the flush threshold is a **byte budget** (memtable live size), tunable per table via `Store::set_memtable_budget`, not an entry count. Each SSTable stores its min/max key so a point lookup **skips** any table whose range cannot contain the key.
-- ⬜ **Compaction, bloom filters** — later steps.
+- ✅ **Compaction** — `Store::compact` merges all SSTables into one (newest value per key, tombstones dropped); runs automatically once the SSTable count exceeds a threshold. The merged table is fsynced before the old files are removed.
+- ⬜ **Bloom filters, block cache** — read-path optimizations, a later step.
 
 The format is fixed deliberately and up front, because a file format is a forever decision: once FerrumDB writes `.sst` files to a device, the reader must be able to load them for the life of that data.
 
@@ -23,7 +24,7 @@ The SSTable solves the one problem the current design cannot:
 
 When the memtable crosses a size threshold, it is **flushed**: written out as one new SSTable, then cleared. Because the `BTreeMap` is already sorted, the flush is a single in-order walk with no extra sort step.
 
-SSTable flush replaces `checkpoint()` as the normal mechanism for bounding both memtable size and WAL growth. After a flush, the entries now safely on disk are removed from the WAL.
+SSTable flush is the normal mechanism for bounding both memtable size and WAL growth; it replaced the earlier snapshot mechanism. After a flush, the entries now safely on disk are removed from the WAL.
 
 ---
 
@@ -251,12 +252,28 @@ The numeric id is a monotonic counter. **Higher id = newer**, which directly giv
 
 ---
 
+## Compaction
+
+As SSTables accumulate, a point lookup has more tables to consult and deleted keys are never reclaimed. `Store::compact` performs a **full merge**: it reads every entry from every SSTable (oldest → newest so newer values overwrite older), drops tombstones (a full merge leaves nothing older for a tombstone to shadow), and writes the result as a single new SSTable. It runs automatically once the SSTable count exceeds `MAX_SSTABLES`.
+
+```
+compact()
+  ├─ merge all SSTables, newest value per key wins
+  ├─ drop tombstones (and the values they shadowed)
+  ├─ write one new SSTable, fsync it
+  └─ delete the old SSTable files
+```
+
+The new table is fsynced **before** the old files are removed. A crash in between is safe: on reopen both the merged table and the stale ones load, the merged table has the highest id (newest), and it wins every read; the next compaction cleans up the leftovers. The current implementation buffers the merged data in memory, so peak memory during compaction is roughly the combined live size of the tables being merged — fine while that stays within a few memtable budgets, and a candidate for a streaming merge later.
+
+---
+
 ## Scope — What This Spec Does NOT Cover
 
 These are deliberately left for later steps so the first SSTable implementation stays tractable:
 
-- **Compaction** — merging multiple SSTables into one, dropping tombstones and shadowed values. Without it, reads slow down as files accumulate, but correctness holds.
 - **Bloom filters** — per-SSTable membership filters to skip block reads for absent keys.
+- **Block cache** — keeping hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
 - **Configurable block size** — `BLOCK_SIZE` is a hardcoded `const` (4096) for now. It becomes a `Config` field only when a second knob justifies a config struct.
 - **Secondary indexes** — a separate parallel set of SSTables mapping value → key. Not meaningful until values become structured rather than scalar.
 - **Compression** — block compression (e.g. LZ4) trades CPU for disk space. Easy to add later as a per-block flag.

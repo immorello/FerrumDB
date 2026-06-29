@@ -202,20 +202,20 @@ delete_value("price")
 
 An explicit multi-operation `Transaction` appends every buffered op, then calls `write_commit` once — one fsync for the whole batch. If the `BTreeMap` update is reached, the WAL write already succeeded; the write lands in both or in neither.
 
-### Recovery path (`Store::open`)
+### Recovery path (`Store::open_with_dir`)
 
 ```
-open_with_paths(snapshot_path, wal_path)
+open_with_dir(dir)
   │
-  ├─ if snapshot exists → load_from_file()
-  │     reads protobuf snapshot into the memtable (all as Entry::Value)
+  ├─ discover sstable_<id>.sst files, load each index, order newest → oldest
   │
   ├─ wal.read_all()
   │     returns all entries in write order
   │
-  ├─ buffer PUT/DELETE entries until a COMMIT is seen, then apply the batch:
-  │     PUT    → data.insert(key, Entry::Value(value))
-  │     DELETE → data.insert(key, Entry::Tombstone)
+  ├─ buffer PUT/DELETE entries until a COMMIT is seen, then apply the batch
+  │  to the memtable:
+  │     PUT    → memtable.insert(key, Entry::Value(value))
+  │     DELETE → memtable.insert(key, Entry::Tombstone)
   │     update sequence to max(sequence, entry.sequence)
   │
   ├─ entries after the last COMMIT are discarded (uncommitted at crash time)
@@ -223,18 +223,18 @@ open_with_paths(snapshot_path, wal_path)
   └─ return Store with recovered state
 ```
 
-Committed WAL entries are replayed on top of the snapshot. This is safe because entries written before the last checkpoint are already baked into the snapshot — the checkpoint clears the WAL immediately after writing the snapshot.
+Committed WAL entries are replayed into the memtable on top of the SSTables. This is safe because entries written before the last flush are already in an SSTable — a flush clears the WAL immediately after the SSTable is fsynced.
 
-### Checkpoint path
+### Flush path
 
 ```
-checkpoint()
+flush()
   │
-  ├─ save_to_file()   ← write + fsync snapshot to disk
-  └─ wal.clear()      ← truncate + fsync WAL file
+  ├─ write the memtable to a new sstable_<id>.sst  ← fsynced
+  └─ wal.clear()                                   ← truncate + fsync WAL file
 ```
 
-The snapshot is always written before the WAL is cleared. If the process crashes between these two steps, the next `open` loads the good snapshot and finds an empty or partial WAL — both are safe.
+The SSTable is always fsynced before the WAL is cleared. If the process crashes between these two steps, the next open finds the complete SSTable and a WAL that still holds the same entries — they replay harmlessly on top of the SSTable.
 
 ---
 
@@ -247,35 +247,35 @@ use ferrumdb_core::store::{Store, Value};
 
 // First run
 {
-    let mut store = Store::open_with_paths("./data/snap.pb", "./data/wal.log").unwrap();
+    let mut store = Store::open_with_dir("./data/cities").unwrap();
     store.set_value("city".to_string(), Value::Text("Rome".to_string())).unwrap();
     store.set_value("population".to_string(), Value::Integer(2_873_000)).unwrap();
-    // Process exits here — no checkpoint called
+    // Process exits here — no flush called
 }
 
 // Second run — WAL replay restores both keys
 {
-    let store = Store::open_with_paths("./data/snap.pb", "./data/wal.log").unwrap();
+    let store = Store::open_with_dir("./data/cities").unwrap();
     assert_eq!(store.get_value("city").unwrap(), Some(Value::Text("Rome".to_string())));
     assert_eq!(store.get_value("population").unwrap(), Some(Value::Integer(2_873_000)));
 }
 ```
 
-### Checkpoint then write more
+### Flush then write more
 
 ```rust
-let mut store = Store::open_with_paths("./data/snap.pb", "./data/wal.log").unwrap();
+let mut store = Store::open_with_dir("./data/cities").unwrap();
 
 store.set_value("a".to_string(), Value::Integer(1)).unwrap();
 store.set_value("b".to_string(), Value::Integer(2)).unwrap();
 
-// Snapshot written, WAL cleared
-store.checkpoint().unwrap();
+// Memtable written to an SSTable, WAL cleared
+store.flush().unwrap();
 
 // These land only in the WAL
 store.set_value("c".to_string(), Value::Integer(3)).unwrap();
 
-// After restart: a and b come from snapshot, c comes from WAL
+// After restart: a and b come from the SSTable, c comes from the WAL
 ```
 
 ### Inspect the WAL directly
@@ -301,11 +301,11 @@ Bit-flip corruption inside a valid-length record is not detected. A CRC32 writte
 
 ### File reopened on every append
 
-The WAL file is opened, written, and closed on each `append` and `write_commit` call. For high write rates this is expensive — it is the main reason a batched transaction is only a few times faster than N single writes rather than orders of magnitude. The fix is to hold the file open for the lifetime of the `Wal` instance.
+The WAL file is opened, written, and closed on each `append` and `write_commit` call. For high write rates this is expensive — it is the main reason a batched transaction is only a few times faster than N single writes rather than orders of magnitude. The fix is to hold the file open for the lifetime of the `Wal` instance; this is the **Engine optimization** step on the roadmap, planned before the API layer.
 
 ---
 
 ## What the WAL Now Does (previously listed as missing)
 
 - **Multi-operation atomicity** — via the `COMMIT` marker. `append` no longer fsyncs; `write_commit` writes a COMMIT entry and fsyncs once for the whole batch. On replay, entries not followed by a COMMIT are discarded. See the write and recovery paths above.
-- **Write lock** — `Store::open_with_paths` acquires an exclusive `flock` on `./data/<table>/LOCK`, held for the lifetime of the `Store` and released on drop. A second open of the same table fails immediately.
+- **Write lock** — `Store::open_with_dir` acquires an exclusive `flock` on `./data/<table>/LOCK`, held for the lifetime of the `Store` and released on drop. A second open of the same table fails immediately.

@@ -69,11 +69,11 @@ The file lock is implemented with a direct `flock` syscall via `extern "C"` — 
 
 ### Store and Recovery
 
-The `Store` struct owns the WAL, the memtable, and the lock:
+The `Store` struct owns the WAL, the memtable, the SSTables, and the lock:
 
-- `set_value` and `delete_value` write to the WAL first, then update the BTreeMap. In-memory state is never modified unless the WAL write succeeds.
-- `checkpoint()` writes a protobuf snapshot to disk and clears the WAL. This bounds WAL growth until SSTable flush is implemented.
-- `open_with_paths()` loads the last snapshot, replays uncommitted WAL entries on top, and sets the sequence counter to the highest value seen so new writes never reuse old sequence numbers.
+- `set_value` and `delete_value` write to the WAL first, then update the memtable. In-memory state is never modified unless the WAL write succeeds.
+- `flush()` writes the memtable to a new SSTable and clears the WAL (see SSTable Layer below). It replaces the earlier snapshot mechanism.
+- `open_with_dir()` discovers the table's SSTables, replays uncommitted WAL entries on top, and sets the sequence counter to the highest value seen so new writes never reuse old sequence numbers.
 
 ### Table Model
 
@@ -81,27 +81,31 @@ Each table is an independent `Store` instance with its own files under `./data/<
 
 ```
 ./data/users/
-  ├── snapshot.pb   ← latest checkpoint
-  ├── wal.log       ← uncommitted writes since last checkpoint
-  └── LOCK          ← exclusive lock, held while the table is open
+  ├── wal.log           ← committed writes since the last flush
+  ├── LOCK              ← exclusive lock, held while the table is open
+  └── sstable_*.sst     ← immutable on-disk tables (newest id wins)
 ```
 
 Opening a table that is already open by another process fails immediately with an error. Different tables can be opened simultaneously without interference.
 
 ### Performance Baseline
 
-Measured on macOS (debug build, APFS — pessimistic for fsync):
+Measured on an Apple Mac mini (APFS), 1000-key workloads:
 
-| Operation | Throughput |
-|---|---|
-| Single write | ~68 writes/sec |
-| Batched transaction (1000 writes, 1 fsync) | ~184 writes/sec |
-| Read (in-memory BTreeMap) | ~496k reads/sec |
-| WAL replay on recovery | ~89k entries/sec |
+| Operation | Debug | Release | Bound by |
+|---|---|---|---|
+| Single durable write | ~69/sec | ~66/sec | `fsync` (~14 ms/commit) |
+| Batched transaction (1000 writes, 1 fsync) | ~181/sec | ~188/sec | WAL file open per append |
+| Read (in-memory) | ~0.9M/sec | ~1.95M/sec | CPU |
+| Recovery (WAL replay) | ~147k/sec | ~256k/sec | CPU |
+| Flush 1000 entries → SSTable | ~16 ms | ~9 ms | CPU |
 
-The write bottleneck is fsync latency, which is ~10-15ms on macOS APFS and ~1-5ms on Linux embedded storage (the actual target). On real hardware single writes would be in the 200-1000 writes/sec range; batched transactions would reach 2,000-10,000 writes/sec depending on batch size.
+Two different walls explain these numbers:
 
-Reads are pure in-memory and will change once the SSTable layer is in place — keys flushed out of the memtable will require disk access.
+- **Single writes are `fsync`-bound.** Every commit fsyncs, and APFS fsync is ~10–15 ms (it is ~1–5 ms on the Linux embedded storage FerrumDB actually targets). This is the same wall every durable embedded engine hits on the same hardware — the release build does not change it.
+- **Batched writes are syscall-bound, not yet fsync-bound.** A batch pays a single fsync, so its cost is dominated by the WAL reopening the file on every append. Holding the WAL handle open (see Roadmap → Engine optimization) is expected to lift batched throughput into the thousands/sec.
+
+Reads are currently served from the in-memory memtable. Once data ages into SSTables, reads involve disk plus the per-SSTable key-range skip; bloom filters and a block cache (Roadmap) are what will keep that fast.
 
 ### SSTable Layer
 
@@ -113,9 +117,15 @@ The memtable is flushed to immutable on-disk SSTables, which is what bounds memo
 
 SSTable flush replaces the earlier snapshot mechanism as the single path to disk.
 
+### Compaction
+
+As SSTables accumulate, reads must consult more files and deleted keys are never reclaimed. `Store::compact()` merges all SSTables into one, keeping the newest value per key and dropping tombstones (a full merge leaves nothing older for a tombstone to shadow). Compaction runs automatically once the SSTable count exceeds a threshold.
+
+The merged SSTable is fsynced **before** the old files are deleted, so a crash in between is safe: the stale tables simply replay behind the newer merged table and lose to it on every read.
+
 ### Testing
 
-Integration tests cover eight areas:
+Integration tests cover nine areas:
 
 - `tests/wal.rs` — append, read-back, persistence across instances, clear
 - `tests/recovery.rs` — WAL replay on restart, delete replay, flush clears WAL, recovery after flush, SSTable + WAL combined recovery, sequence continuity, tombstone shadowing across SSTables and from the WAL
@@ -124,6 +134,7 @@ Integration tests cover eight areas:
 - `tests/transaction.rs` — commit visibility, rollback on drop, crash recovery of committed transactions, uncommitted entry discard, mixed put/delete transactions
 - `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table, key-range reporting and out-of-range skip
 - `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, byte-budget auto-flush bounds the memtable
+- `tests/compaction.rs` — merge into one, newest value wins, deleted keys dropped, all-deleted leaves nothing, compaction survives recovery, auto-compaction bounds the SSTable count
 - `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, WAL replay time, flush time
 
 ---
@@ -146,14 +157,22 @@ SSTable flush is what makes FerrumDB viable on memory-constrained embedded devic
 - ✅ The flush byte budget is tunable per table (`set_memtable_budget`) for the target device.
 - ✅ Each SSTable records its key range; a lookup skips any SSTable whose range excludes the key, with no disk read.
 
-### Step 3 — Compaction
+### Step 3 — Compaction ✅
 
-- As SSTables accumulate, reads degrade (more files to check per lookup) and deleted keys are never reclaimed.
-- Compaction merges SSTables into fewer files, discarding tombstones and shadowed values.
-- A simple size-triggered strategy (merge all files when there are more than N) is the starting point.
-- Bloom filters can be added later to eliminate unnecessary SSTable reads for missing keys.
+- ✅ Compaction merges all SSTables into one, keeping the newest value per key and dropping tombstones and shadowed values.
+- ✅ A size-triggered strategy: a full merge runs once the SSTable count exceeds a threshold.
+- ✅ Crash-safe: the merged table is fsynced before the old files are removed.
 
-### Step 4 — API layer
+### Step 4 — Engine optimization (next)
+
+The fundamentals are in place; the goal here is to make the engine as fast as it can be *before* an API freezes the hot paths. The performance numbers above point directly at the work:
+
+- **WAL file-handle reuse** — the WAL currently reopens the log file on every append, which is the bottleneck for batched writes (a batch already pays only one fsync). Holding the handle open for the Store's lifetime should lift batched throughput into the thousands/sec.
+- **Group commit** — let concurrent or queued writes share a single fsync.
+- **Bloom filters** — a per-SSTable membership filter to skip block reads for keys that are definitely absent.
+- **Block cache** — keep hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
+
+### Step 5 — API layer
 
 - A minimal public Rust API designed for embedding.
 - A C FFI layer so FerrumDB can be used from C, Swift, Python, and other languages — the same way SQLite is embedded across ecosystems.

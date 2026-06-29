@@ -233,54 +233,64 @@ impl SsTable {
             Err(0) => return Ok(None), // key precedes the first block
             Err(i) => i - 1,
         };
-        let entry = &self.index[pos];
+        let index_entry = &self.index[pos];
 
-        // Read exactly that one block.
+        // Read that one block and scan it for an exact key match. Records are
+        // sorted, so we can stop once a record key passes the target.
         let mut f = File::open(&self.path).map_err(|e| AppError::IoError(e.to_string()))?;
-        f.seek(SeekFrom::Start(entry.block_offset)).map_err(|e| AppError::IoError(e.to_string()))?;
-        let mut block = vec![0u8; entry.block_len as usize];
-        f.read_exact(&mut block).map_err(|e| AppError::IoError(e.to_string()))?;
-
-        // Verify the block CRC (last 4 bytes).
-        let split = block.len() - 4;
-        let stored_crc = u32::from_be_bytes(block[split..].try_into().unwrap());
-        if crc32(&block[..split]) != stored_crc {
-            return Err(AppError::DecodeError(format!(
-                "SSTable block CRC mismatch at offset {}",
-                entry.block_offset
-            )));
-        }
-
-        // Scan the block's records for an exact match.
-        let records = &block[..split];
+        let records = self.read_block(&mut f, index_entry)?;
         let mut c = 0usize;
         while c < records.len() {
-            let key_len = read_u32(records, &mut c)? as usize;
-            let rec_key = read_string(records, &mut c, key_len)?;
-            let rec_type = read_u8(records, &mut c)?;
-            let val_len = read_u32(records, &mut c)? as usize;
-
-            if rec_type == TYPE_VALUE {
-                let val_bytes = read_bytes(records, &mut c, val_len)?;
-                if rec_key == key {
-                    let msg = ValueMessage::decode(val_bytes)
-                        .map_err(|e| AppError::DecodeError(e.to_string()))?;
-                    return Ok(Some(Entry::Value(Value::from_proto(&msg)?)));
-                }
-            } else {
-                // Tombstone — val_len is 0, no value bytes.
-                if rec_key == key {
-                    return Ok(Some(Entry::Tombstone));
-                }
+            let (rec_key, rec_entry) = decode_record(&records, &mut c)?;
+            if rec_key == key {
+                return Ok(Some(rec_entry));
             }
-
-            // Records are sorted; once we pass the target key it cannot appear later.
             if rec_key.as_str() > key {
                 break;
             }
         }
 
         Ok(None)
+    }
+
+    /// Reads every entry in the table, in ascending key order. Used by compaction
+    /// to merge tables. Loads one block at a time, but returns all entries in
+    /// memory — callers should expect O(table size) allocation.
+    pub fn read_all_entries(&self) -> Result<Vec<(String, Entry)>, AppError> {
+        let mut out = Vec::new();
+        if self.index.is_empty() {
+            return Ok(out);
+        }
+
+        let mut f = File::open(&self.path).map_err(|e| AppError::IoError(e.to_string()))?;
+        for index_entry in &self.index {
+            let records = self.read_block(&mut f, index_entry)?;
+            let mut c = 0usize;
+            while c < records.len() {
+                out.push(decode_record(&records, &mut c)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads one data block, verifies its CRC, and returns just the record bytes
+    /// (the trailing 4-byte CRC stripped off).
+    fn read_block(&self, f: &mut File, index_entry: &IndexEntry) -> Result<Vec<u8>, AppError> {
+        f.seek(SeekFrom::Start(index_entry.block_offset))
+            .map_err(|e| AppError::IoError(e.to_string()))?;
+        let mut block = vec![0u8; index_entry.block_len as usize];
+        f.read_exact(&mut block).map_err(|e| AppError::IoError(e.to_string()))?;
+
+        let split = block.len() - 4;
+        let stored_crc = u32::from_be_bytes(block[split..].try_into().unwrap());
+        if crc32(&block[..split]) != stored_crc {
+            return Err(AppError::DecodeError(format!(
+                "SSTable block CRC mismatch at offset {}",
+                index_entry.block_offset
+            )));
+        }
+        block.truncate(split);
+        Ok(block)
     }
 
     /// Number of data blocks (= sparse index entries). Useful for tests.
@@ -319,6 +329,23 @@ fn encode_record(out: &mut Vec<u8>, key: &str, entry: &Entry) {
             write_u32(out, 0);
         }
     }
+}
+
+/// Decodes one record at `*c`, advancing the cursor past it.
+fn decode_record(buf: &[u8], c: &mut usize) -> Result<(String, Entry), AppError> {
+    let key_len = read_u32(buf, c)? as usize;
+    let key = read_string(buf, c, key_len)?;
+    let rec_type = read_u8(buf, c)?;
+    let val_len = read_u32(buf, c)? as usize;
+
+    let entry = if rec_type == TYPE_VALUE {
+        let val_bytes = read_bytes(buf, c, val_len)?;
+        let msg = ValueMessage::decode(val_bytes).map_err(|e| AppError::DecodeError(e.to_string()))?;
+        Entry::Value(Value::from_proto(&msg)?)
+    } else {
+        Entry::Tombstone
+    };
+    Ok((key, entry))
 }
 
 fn finalize_block(
