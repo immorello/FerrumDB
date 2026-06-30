@@ -13,10 +13,15 @@ use prost::Message;
 /// Default path for the WAL log file
 pub const WAL_PATH: &str = "./data/wal.log";
 
-/// Write-Ahead Log structure
+/// Write-Ahead Log structure.
+///
+/// Holds the path and a cached append handle. The handle is opened lazily on the
+/// first write and reused for the WAL's lifetime, so appends do not pay a file
+/// open/close each — the dominant cost of batched writes before this.
 #[derive(Debug, Default)]
 pub struct Wal {
     file_path: String,
+    file: Option<File>,
 }
 
 impl Wal {
@@ -31,38 +36,38 @@ impl Wal {
         if let Some(parent) = Path::new(&file_path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        Wal { file_path }
+        Wal { file_path, file: None }
+    }
+
+    /// Returns the cached append handle, opening it on first use.
+    fn writer(&mut self) -> Result<&mut File, AppError> {
+        if self.file.is_none() {
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.file_path)
+                .map_err(|e| AppError::IoError(e.to_string()))?;
+            self.file = Some(f);
+        }
+        Ok(self.file.as_mut().unwrap())
     }
 
     /// Appends a WAL entry to the log file without fsyncing.
     ///
     /// Not durable on its own — always follow a batch of appends with
     /// `write_commit()` to make them durable and atomically visible on recovery.
-    pub fn append(&self, entry: &WalEntry) -> Result<(), AppError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_path)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-
-        let bytes = entry.encode_to_vec();
-        let len = bytes.len() as u64;
-
-        file.write_all(&len.to_be_bytes())
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        file.write_all(&bytes)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        file.flush()
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-
-        Ok(())
+    pub fn append(&mut self, entry: &WalEntry) -> Result<(), AppError> {
+        let framed = frame(entry);
+        self.writer()?
+            .write_all(&framed)
+            .map_err(|e| AppError::IoError(e.to_string()))
     }
 
     /// Writes a COMMIT marker and fsyncs — makes all preceding entries durable.
     ///
-    /// On recovery, only entries that precede a COMMIT are replayed.
-    /// Any entries after the last COMMIT are discarded (they were uncommitted at crash time).
-    pub fn write_commit(&self, sequence: u64) -> Result<(), AppError> {
+    /// On recovery, only entries that precede a COMMIT are replayed; any entries
+    /// after the last COMMIT are truncated away (they were uncommitted at crash time).
+    pub fn write_commit(&mut self, sequence: u64) -> Result<(), AppError> {
         let commit_entry = WalEntry {
             operation: Operation::Commit.into(),
             key: String::new(),
@@ -70,99 +75,69 @@ impl Wal {
             sequence,
             timestamp: 0,
         };
+        let framed = frame(&commit_entry);
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_path)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-
-        let bytes = commit_entry.encode_to_vec();
-        let len = bytes.len() as u64;
-
-        file.write_all(&len.to_be_bytes())
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        file.write_all(&bytes)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        file.flush()
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-
+        let file = self.writer()?;
+        file.write_all(&framed).map_err(|e| AppError::IoError(e.to_string()))?;
+        file.sync_all().map_err(|e| AppError::IoError(e.to_string()))?;
         Ok(())
     }
 
-    /// Reads all entries from the WAL file
-    /// 
-    /// Returns a vector of WalEntry in the order they were written.
-    /// Skips any corrupted entries (returns what it can read).
+    /// Reads all entries from the WAL file, in write order. Stops at a truncated
+    /// tail. Used by tests to inspect the raw log; recovery uses
+    /// [`read_for_recovery`](Self::read_for_recovery) instead.
     pub fn read_all(&self) -> Result<Vec<WalEntry>, AppError> {
-        if !Path::new(&self.file_path).exists() {
-            return Ok(Vec::new());
+        let buffer = match self.read_file()? {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        Ok(parse_buffer(&buffer).0)
+    }
+
+    /// Reads the committed entries for recovery and removes any uncommitted tail
+    /// (bytes after the last COMMIT) from the file. Truncating the tail prevents a
+    /// later COMMIT from silently adopting writes from a crashed session.
+    pub fn read_for_recovery(&mut self) -> Result<Vec<WalEntry>, AppError> {
+        let buffer = match self.read_file()? {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+
+        let (mut entries, committed_count, committed_end) = parse_buffer(&buffer);
+
+        if committed_end < buffer.len() {
+            // Drop the uncommitted tail from the file, then forget any cached
+            // handle so the next append reopens at the truncated end.
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&self.file_path)
+                .map_err(|e| AppError::IoError(e.to_string()))?;
+            f.set_len(committed_end as u64).map_err(|e| AppError::IoError(e.to_string()))?;
+            f.sync_all().map_err(|e| AppError::IoError(e.to_string()))?;
+            self.file = None;
         }
 
-        let mut file = File::open(&self.file_path)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-
-        let mut entries = Vec::new();
-        let mut buffer = Vec::new();
-
-        // Read the entire file
-        file
-            .read_to_end(&mut buffer)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-
-        // Parse entries from the buffer
-        let mut offset = 0;
-        while offset < buffer.len() {
-            // Check if we have enough bytes for the length prefix
-            if offset + 8 > buffer.len() {
-                // Incomplete length prefix - corrupted tail
-                break;
-            }
-
-            // Read the length prefix (8 bytes, big-endian)
-            let len = u64::from_be_bytes([
-                buffer[offset],
-                buffer[offset + 1],
-                buffer[offset + 2],
-                buffer[offset + 3],
-                buffer[offset + 4],
-                buffer[offset + 5],
-                buffer[offset + 6],
-                buffer[offset + 7],
-            ]) as usize;
-
-            offset += 8;
-
-            // Check if we have enough bytes for the entry
-            if offset + len > buffer.len() {
-                // Incomplete entry - corrupted tail
-                break;
-            }
-
-            // Decode the entry
-            match WalEntry::decode(&buffer[offset..offset + len]) {
-                Ok(entry) => entries.push(entry),
-                Err(e) => {
-                    // Skip corrupted entry and continue
-                    eprintln!("WAL: Failed to decode entry at offset {}: {}", offset, e);
-                }
-            }
-
-            offset += len;
-        }
-
+        entries.truncate(committed_count);
         Ok(entries)
     }
 
-    /// Clears the WAL file (called after a checkpoint).
-    /// Truncates the file and fsyncs so the empty state is durable before writes resume.
-    pub fn clear(&self) -> Result<(), AppError> {
-        let file = File::create(&self.file_path)
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| AppError::IoError(e.to_string()))?;
+    /// Reads the whole WAL file into memory, or `None` if it does not exist.
+    fn read_file(&self) -> Result<Option<Vec<u8>>, AppError> {
+        if !Path::new(&self.file_path).exists() {
+            return Ok(None);
+        }
+        let mut file = File::open(&self.file_path).map_err(|e| AppError::IoError(e.to_string()))?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).map_err(|e| AppError::IoError(e.to_string()))?;
+        Ok(Some(buffer))
+    }
+
+    /// Clears the WAL file (called after a flush). Truncates the file and fsyncs
+    /// so the empty state is durable before writes resume.
+    pub fn clear(&mut self) -> Result<(), AppError> {
+        self.file = None; // drop the cached append handle before truncating
+        let file = File::create(&self.file_path).map_err(|e| AppError::IoError(e.to_string()))?;
+        file.sync_all().map_err(|e| AppError::IoError(e.to_string()))?;
         Ok(())
     }
 
@@ -170,6 +145,56 @@ impl Wal {
     pub fn path(&self) -> &str {
         &self.file_path
     }
+}
+
+/// Frames one entry as an 8-byte big-endian length prefix followed by its
+/// protobuf bytes, in a single buffer so it can be written with one `write_all`.
+fn frame(entry: &WalEntry) -> Vec<u8> {
+    let bytes = entry.encode_to_vec();
+    let mut framed = Vec::with_capacity(8 + bytes.len());
+    framed.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    framed.extend_from_slice(&bytes);
+    framed
+}
+
+/// Parses length-prefixed records from `buffer`. Returns all decoded entries, the
+/// number of entries up to and including the last COMMIT, and the byte offset just
+/// past that last COMMIT (0 if there is none). Stops at a truncated tail.
+fn parse_buffer(buffer: &[u8]) -> (Vec<WalEntry>, usize, usize) {
+    let mut entries = Vec::new();
+    let mut committed_count = 0;
+    let mut committed_end = 0;
+
+    let mut offset = 0;
+    while offset < buffer.len() {
+        if offset + 8 > buffer.len() {
+            break; // incomplete length prefix — truncated tail
+        }
+        let len = u64::from_be_bytes(buffer[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+
+        if offset + len > buffer.len() {
+            break; // incomplete entry — truncated tail
+        }
+
+        match WalEntry::decode(&buffer[offset..offset + len]) {
+            Ok(entry) => {
+                let is_commit = entry.operation() == Operation::Commit;
+                entries.push(entry);
+                offset += len;
+                if is_commit {
+                    committed_count = entries.len();
+                    committed_end = offset;
+                }
+            }
+            Err(e) => {
+                eprintln!("WAL: Failed to decode entry at offset {}: {}", offset, e);
+                offset += len;
+            }
+        }
+    }
+
+    (entries, committed_count, committed_end)
 }
 
 /// Helper functions for creating WAL entries from store operations

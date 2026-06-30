@@ -198,3 +198,40 @@ fn test_wal_delete_shadows_sstable_value() {
 
     teardown(&dir);
 }
+
+// An uncommitted WAL tail (a crash between append and COMMIT) must be truncated
+// on recovery so a *later* COMMIT cannot silently adopt it.
+#[test]
+fn test_uncommitted_tail_not_adopted_by_later_commit() {
+    let dir = setup("uncommitted_tail");
+
+    // A normal committed write.
+    {
+        let mut store = Store::open_with_dir(&dir).unwrap();
+        store.set_value("committed".to_string(), Value::Integer(1)).unwrap();
+    }
+
+    // Simulate a crash that left an uncommitted PUT in the WAL (no COMMIT after).
+    {
+        let mut raw = Wal::with_path(wal_path(&dir));
+        let ghost = Wal::create_put_entry("ghost".to_string(), &Value::Integer(99), 50);
+        raw.append(&ghost).unwrap();
+    }
+
+    // Reopen (truncates the uncommitted tail), then commit a brand-new write.
+    {
+        let mut store = Store::open_with_dir(&dir).unwrap();
+        assert_eq!(store.get_value("ghost").unwrap(), None, "uncommitted entry must not survive reopen");
+        store.set_value("after".to_string(), Value::Integer(2)).unwrap();
+    }
+
+    // The ghost must still be absent — session 2's COMMIT must not have adopted it.
+    {
+        let store = Store::open_with_dir(&dir).unwrap();
+        assert_eq!(store.get_value("ghost").unwrap(), None, "uncommitted entry must never be resurrected");
+        assert_eq!(store.get_value("committed").unwrap(), Some(Value::Integer(1)));
+        assert_eq!(store.get_value("after").unwrap(), Some(Value::Integer(2)));
+    }
+
+    teardown(&dir);
+}

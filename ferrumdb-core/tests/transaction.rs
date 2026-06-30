@@ -90,7 +90,7 @@ fn test_uncommitted_entries_discarded_on_recovery() {
 
         // Write directly to the WAL without a COMMIT — simulates a crash mid-write.
         use ferrumdb_core::wal::Wal;
-        let raw_wal = Wal::with_path(wal_path(&dir));
+        let mut raw_wal = Wal::with_path(wal_path(&dir));
         let entry = Wal::create_put_entry("uncommitted".to_string(), &Value::Integer(2), 99);
         raw_wal.append(&entry).unwrap();
         // No write_commit — process "crashes" here.

@@ -88,10 +88,11 @@ message ValueMessage {
 ```rust
 pub struct Wal {
     file_path: String,
+    file: Option<File>,
 }
 ```
 
-Holds only the path to the WAL file. It is stateless between calls — the file is opened and closed on every `append`. There is no held file descriptor.
+Holds the path and a cached append handle. The handle is opened lazily on the first write and reused for the WAL's lifetime, so appends do not pay a file open/close each — the dominant cost of batched writes before this. Writes therefore take `&mut self`.
 
 ### Constructors
 
@@ -108,30 +109,31 @@ Both constructors call `create_dir_all` on the parent directory so the first `ap
 ### `append`
 
 ```rust
-pub fn append(&self, entry: &WalEntry) -> Result<(), AppError>
+pub fn append(&mut self, entry: &WalEntry) -> Result<(), AppError>
 ```
 
-Opens the file in append mode, writes the length prefix followed by the protobuf payload, and calls `flush`. **It does not fsync.** A bare `append` is therefore not durable on its own — it must be followed by `write_commit`, which fsyncs the whole batch at once.
+Frames the entry (8-byte length prefix + protobuf payload) and writes it to the cached append handle in a single `write_all`. **It does not fsync.** A bare `append` is therefore not durable on its own — it must be followed by `write_commit`, which fsyncs the whole batch at once.
 
 This split is what makes transactions cheap: N operations are appended, then a single `write_commit` pays one fsync for all of them.
 
 ### `write_commit`
 
 ```rust
-pub fn write_commit(&self, sequence: u64) -> Result<(), AppError>
+pub fn write_commit(&mut self, sequence: u64) -> Result<(), AppError>
 ```
 
-Appends a `COMMIT` entry and then calls `flush` followed by `sync_all`. The `sync_all` issues the `fsync` that makes every preceding `append` since the last commit durable. On replay, any entries written after the last `COMMIT` are discarded — they were uncommitted when the process crashed.
+Writes a `COMMIT` entry to the cached handle and then calls `sync_all`. The `sync_all` issues the `fsync` that makes every preceding `append` since the last commit durable. On recovery, any entries written after the last `COMMIT` are truncated from the file (see `read_for_recovery`).
 
-**The file is reopened on every call.** This is correct but expensive for high write rates. It is a known limitation.
-
-### `read_all`
+### `read_all` and `read_for_recovery`
 
 ```rust
 pub fn read_all(&self) -> Result<Vec<WalEntry>, AppError>
+pub fn read_for_recovery(&mut self) -> Result<Vec<WalEntry>, AppError>
 ```
 
-Reads the entire file into memory, then parses records sequentially. Returns all successfully decoded entries in write order.
+`read_all` reads the entire file into memory, parses records sequentially, and returns all successfully decoded entries in write order — used by tests to inspect the raw log.
+
+`read_for_recovery` is what the `Store` uses on open. It returns only the entries up to and including the last `COMMIT`, and **truncates the file** to drop any uncommitted tail. This closes a subtle hole: without it, an uncommitted entry left by a crashed session could be silently adopted by the *next* session's `COMMIT`.
 
 Handles two failure cases:
 
@@ -299,13 +301,10 @@ for entry in &entries {
 
 Bit-flip corruption inside a valid-length record is not detected. A CRC32 written as part of the frame header (before or after the length prefix) would catch this. The SSTable format already does this per block (see `docs/sstable.md`); the WAL does not yet.
 
-### File reopened on every append
-
-The WAL file is opened, written, and closed on each `append` and `write_commit` call. For high write rates this is expensive — it is the main reason a batched transaction is only a few times faster than N single writes rather than orders of magnitude. The fix is to hold the file open for the lifetime of the `Wal` instance; this is the **Engine optimization** step on the roadmap, planned before the API layer.
-
 ---
 
 ## What the WAL Now Does (previously listed as missing)
 
-- **Multi-operation atomicity** — via the `COMMIT` marker. `append` no longer fsyncs; `write_commit` writes a COMMIT entry and fsyncs once for the whole batch. On replay, entries not followed by a COMMIT are discarded. See the write and recovery paths above.
+- **Multi-operation atomicity** — via the `COMMIT` marker. `append` no longer fsyncs; `write_commit` writes a COMMIT entry and fsyncs once for the whole batch. On recovery, entries not followed by a COMMIT are truncated. See the write and recovery paths above.
 - **Write lock** — `Store::open_with_dir` acquires an exclusive `flock` on `./data/<table>/LOCK`, held for the lifetime of the `Store` and released on drop. A second open of the same table fails immediately.
+- **Cached append handle** — the WAL holds its file open for its lifetime instead of reopening on every append. This lifted batched-write throughput ~6× and also sped up single writes. The handle is dropped and reopened only on `clear` (after a flush) and when recovery truncates an uncommitted tail.

@@ -94,16 +94,14 @@ Measured on an Apple Mac mini (APFS), 1000-key workloads:
 
 | Operation | Debug | Release | Bound by |
 |---|---|---|---|
-| Single durable write | ~69/sec | ~66/sec | `fsync` (~14 ms/commit) |
-| Batched transaction (1000 writes, 1 fsync) | ~181/sec | ~188/sec | WAL file open per append |
-| Read (in-memory) | ~0.9M/sec | ~1.95M/sec | CPU |
-| Recovery (WAL replay) | ~147k/sec | ~256k/sec | CPU |
-| Flush 1000 entries → SSTable | ~16 ms | ~9 ms | CPU |
+| Single durable write | ~107/sec | ~100/sec | `fsync` (~9–10 ms/commit) |
+| Batched transaction (1000 writes, 1 fsync) | ~950/sec | ~1,200/sec | per-append CPU + one write syscall |
+| Read (in-memory) | ~0.5M/sec | ~0.9–1.9M/sec | CPU |
+| Recovery (WAL replay) | ~70–150k/sec | ~180–250k/sec | CPU |
+| Flush 1000 entries → SSTable | ~21 ms | ~15 ms | CPU |
 
-Two different walls explain these numbers:
-
-- **Single writes are `fsync`-bound.** Every commit fsyncs, and APFS fsync is ~10–15 ms (it is ~1–5 ms on the Linux embedded storage FerrumDB actually targets). This is the same wall every durable embedded engine hits on the same hardware — the release build does not change it.
-- **Batched writes are syscall-bound, not yet fsync-bound.** A batch pays a single fsync, so its cost is dominated by the WAL reopening the file on every append. Holding the WAL handle open (see Roadmap → Engine optimization) is expected to lift batched throughput into the thousands/sec.
+- **Single writes are `fsync`-bound.** Every commit fsyncs, and APFS fsync is ~9–10 ms (it is ~1–5 ms on the Linux embedded storage FerrumDB actually targets). This is the same wall every durable embedded engine hits on the same hardware — the release build does not change it. The WAL holds its file handle open, so a write no longer pays for opening the log; the fsync is all that's left.
+- **Batched writes** amortize a single fsync over the whole batch and now reach ~1,200/sec — a 6× gain from the WAL file-handle reuse (previously ~190/sec, when every append reopened the log).
 
 Reads are currently served from the in-memory memtable. Once data ages into SSTables, reads involve disk plus the per-SSTable key-range skip; bloom filters and a block cache (Roadmap) are what will keep that fast.
 
@@ -163,14 +161,15 @@ SSTable flush is what makes FerrumDB viable on memory-constrained embedded devic
 - ✅ A size-triggered strategy: a full merge runs once the SSTable count exceeds a threshold.
 - ✅ Crash-safe: the merged table is fsynced before the old files are removed.
 
-### Step 4 — Engine optimization (next)
+### Step 4 — Engine optimization (in progress)
 
-The fundamentals are in place; the goal here is to make the engine as fast as it can be *before* an API freezes the hot paths. The performance numbers above point directly at the work:
+The fundamentals are in place; the goal here is to make the engine as fast as it can be *before* an API freezes the hot paths.
 
-- **WAL file-handle reuse** — the WAL currently reopens the log file on every append, which is the bottleneck for batched writes (a batch already pays only one fsync). Holding the handle open for the Store's lifetime should lift batched throughput into the thousands/sec.
-- **Group commit** — let concurrent or queued writes share a single fsync.
-- **Bloom filters** — a per-SSTable membership filter to skip block reads for keys that are definitely absent.
-- **Block cache** — keep hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
+- ✅ **WAL file-handle reuse** — the WAL holds its append handle open for its lifetime instead of reopening the log on every append. This took batched writes from ~190 to ~1,200/sec (6×) and also sped up single writes (they no longer pay two file opens on top of the fsync). The recovery path also now truncates any uncommitted tail so a later commit cannot adopt a crashed session's writes.
+- ⬜ **Bloom filters** — a per-SSTable membership filter (persisted in the file) to skip block reads for keys that are definitely absent.
+- ⬜ **Block cache** — keep hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
+
+*Group commit was considered and deferred:* it batches independent concurrent commits into one fsync, which needs a multi-threaded writer. FerrumDB is intentionally single-writer, and an explicit transaction already provides "many writes, one fsync," so group commit adds complexity without fitting the model.
 
 ### Step 5 — API layer
 

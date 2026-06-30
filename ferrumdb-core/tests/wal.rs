@@ -12,9 +12,9 @@ fn test_append_and_read_entries() {
     
     // Clean up any existing test file
     let _ = fs::remove_file(test_path);
-    
-    let wal = Wal::with_path(test_path);
-    
+
+    let mut wal = Wal::with_path(test_path);
+
     // Test 1: Append PUT entries
     let entry1 = Wal::create_put_entry(
         "user_1".to_string(),
@@ -96,7 +96,7 @@ fn test_wal_persistence() {
     
     // Create WAL and write entries
     {
-        let wal = Wal::with_path(test_path);
+        let mut wal = Wal::with_path(test_path);
         let entry = Wal::create_put_entry(
             "test_key".to_string(),
             &Value::Integer(123),
@@ -126,9 +126,9 @@ fn test_wal_clear() {
     
     // Clean up any existing test file
     let _ = fs::remove_file(test_path);
-    
-    let wal = Wal::with_path(test_path);
-    
+
+    let mut wal = Wal::with_path(test_path);
+
     // Add an entry
     let entry = Wal::create_put_entry(
         "key1".to_string(),

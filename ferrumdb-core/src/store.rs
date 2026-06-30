@@ -199,10 +199,11 @@ impl Store {
         Ok(())
     }
 
-    /// Replays committed WAL entries on top of the current memtable. Entries
-    /// after the last COMMIT are discarded (uncommitted when the process died).
+    /// Replays committed WAL entries on top of the current memtable. The
+    /// uncommitted tail (entries after the last COMMIT) is truncated from the
+    /// WAL by `read_for_recovery`, so a later COMMIT cannot adopt them.
     fn replay_wal(&mut self) -> Result<(), AppError> {
-        let entries = self.wal.read_all()?;
+        let entries = self.wal.read_for_recovery()?;
         let mut pending: Vec<crate::proto::WalEntry> = Vec::new();
 
         for entry in entries {
