@@ -35,7 +35,9 @@ const MAGIC: &[u8; 4] = b"FSST";
 /// Current SSTable format version.
 /// v2 appends the table's min and max key after the sparse index, so a point
 /// lookup can skip a table whose key range cannot contain the key.
-const VERSION: u32 = 2;
+/// v3 appends a bloom filter after the key range, so a lookup can skip a table
+/// that is in range but definitely does not contain the key.
+const VERSION: u32 = 3;
 
 /// Fixed footer size: index_offset(8) + index_len(8) + entry_count(4) + magic(4) + version(4).
 const FOOTER_LEN: usize = 28;
@@ -68,6 +70,58 @@ pub struct SsTable {
     // Used to skip the table entirely when a lookup key falls outside its range.
     min_key: Option<String>,
     max_key: Option<String>,
+    // Membership filter over every key in the table. `None` only for an empty
+    // table. Lets a lookup skip a table that is in range but lacks the key.
+    bloom: Option<BloomFilter>,
+}
+
+/// A bloom filter: a bit array probed by `k` hash functions. A negative answer is
+/// definitive (the key is absent); a positive answer is probabilistic (it may be a
+/// false positive). Built from all of a table's keys at flush time.
+#[derive(Debug)]
+struct BloomFilter {
+    bits: Vec<u8>,
+    k: u32,
+}
+
+impl BloomFilter {
+    /// Sizes the filter for `num_keys` at ~10 bits/key with 7 hash functions,
+    /// which targets a ~1% false-positive rate.
+    fn new(num_keys: usize) -> Self {
+        const BITS_PER_KEY: usize = 10;
+        let m_bits = (num_keys * BITS_PER_KEY).max(64);
+        BloomFilter { bits: vec![0u8; m_bits.div_ceil(8)], k: 7 }
+    }
+
+    /// Bit positions for a key, via double hashing (Kirsch–Mitzenmacher): one
+    /// 64-bit hash split into two, combined as h1 + i*h2.
+    fn positions(&self, key: &str) -> impl Iterator<Item = usize> + '_ {
+        let m = (self.bits.len() * 8) as u64;
+        let h = hash64(key.as_bytes());
+        let h1 = h & 0xFFFF_FFFF;
+        let h2 = (h >> 32) | 1; // force odd so it never collapses to one position
+        (0..self.k as u64).map(move |i| (h1.wrapping_add(i.wrapping_mul(h2)) % m) as usize)
+    }
+
+    fn add(&mut self, key: &str) {
+        for bit in self.positions(key).collect::<Vec<_>>() {
+            self.bits[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+
+    fn maybe_contains(&self, key: &str) -> bool {
+        self.positions(key).all(|bit| self.bits[bit / 8] & (1 << (bit % 8)) != 0)
+    }
+}
+
+/// FNV-1a 64-bit hash. Inlined to avoid a crate dependency, like the block CRC.
+fn hash64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 impl SsTable {
@@ -94,12 +148,16 @@ impl SsTable {
         // first key seen is the min and the last is the max.
         let mut min_key: Option<String> = None;
         let mut max_key: Option<String> = None;
+        // Every key, to build the bloom filter once the count is known. Holds
+        // borrows into the caller's map; bounded by the memtable size.
+        let mut keys: Vec<&str> = Vec::new();
 
         for (key, entry) in entries {
             if min_key.is_none() {
                 min_key = Some(key.clone());
             }
             max_key = Some(key.clone());
+            keys.push(key);
 
             if block.is_empty() {
                 block_first_key = Some(key.clone());
@@ -131,6 +189,20 @@ impl SsTable {
             write_u32(&mut file, max.len() as u32);
             file.extend_from_slice(max.as_bytes());
         }
+        // Bloom filter, also only for a non-empty table. Written after the key
+        // range as: k (u32), bit-length (u32), bit bytes.
+        let bloom = if keys.is_empty() {
+            None
+        } else {
+            let mut b = BloomFilter::new(keys.len());
+            for k in &keys {
+                b.add(k);
+            }
+            write_u32(&mut file, b.k);
+            write_u32(&mut file, b.bits.len() as u32);
+            file.extend_from_slice(&b.bits);
+            Some(b)
+        };
         let index_len = file.len() as u64 - index_offset;
 
         // Footer.
@@ -150,7 +222,7 @@ impl SsTable {
         f.write_all(&file).map_err(|e| AppError::IoError(e.to_string()))?;
         f.sync_all().map_err(|e| AppError::IoError(e.to_string()))?;
 
-        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key })
+        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key, bloom })
     }
 
     /// Opens an existing SSTable: reads the footer, validates it, and loads the
@@ -198,18 +270,24 @@ impl SsTable {
             index.push(IndexEntry { first_key, block_offset, block_len });
         }
 
-        // Key range follows the index entries (absent for an empty table).
-        let (min_key, max_key) = if c < buf.len() {
+        // Key range and bloom filter follow the index entries (both absent for an
+        // empty table; both present together otherwise).
+        let (min_key, max_key, bloom) = if c < buf.len() {
             let min_len = read_u32(&buf, &mut c)? as usize;
             let min = read_string(&buf, &mut c, min_len)?;
             let max_len = read_u32(&buf, &mut c)? as usize;
             let max = read_string(&buf, &mut c, max_len)?;
-            (Some(min), Some(max))
+
+            let k = read_u32(&buf, &mut c)?;
+            let bits_len = read_u32(&buf, &mut c)? as usize;
+            let bits = read_bytes(&buf, &mut c, bits_len)?.to_vec();
+
+            (Some(min), Some(max), Some(BloomFilter { bits, k }))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
-        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key })
+        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key, bloom })
     }
 
     /// Looks up a key. Returns `None` if the key is not present in this table.
@@ -223,6 +301,13 @@ impl SsTable {
         // Skip the whole table if the key falls outside its range — no disk read.
         if let (Some(min), Some(max)) = (&self.min_key, &self.max_key)
             && (key < min.as_str() || key > max.as_str())
+        {
+            return Ok(None);
+        }
+
+        // Skip if the bloom filter says the key is definitely absent — no disk read.
+        if let Some(bloom) = &self.bloom
+            && !bloom.maybe_contains(key)
         {
             return Ok(None);
         }
@@ -303,6 +388,16 @@ impl SsTable {
         match (&self.min_key, &self.max_key) {
             (Some(min), Some(max)) => Some((min.as_str(), max.as_str())),
             _ => None,
+        }
+    }
+
+    /// Bloom-filter membership test: `false` means the key is definitely not in
+    /// this table; `true` means it is probably present (with a small false-positive
+    /// rate). An empty table returns `false` for every key.
+    pub fn might_contain(&self, key: &str) -> bool {
+        match &self.bloom {
+            Some(bloom) => bloom.maybe_contains(key),
+            None => false,
         }
     }
 

@@ -154,6 +154,47 @@ fn test_key_range_reports_min_and_max() {
     teardown(&path);
 }
 
+// The bloom filter never gives a false negative: every key actually in the table
+// must test as "maybe present". (Absent keys are usually — but not always — false.)
+#[test]
+fn test_bloom_no_false_negatives() {
+    let path = setup("bloom_no_fn");
+
+    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    for i in 0..500 {
+        mem.insert(format!("key_{:04}", i), Entry::Value(Value::Integer(i)));
+    }
+    // A deletion: its key must still be in the bloom so a lookup finds the tombstone.
+    mem.insert("key_0123".to_string(), Entry::Tombstone);
+    SsTable::flush(&path, mem.iter()).unwrap();
+
+    let sst = SsTable::open(&path).unwrap();
+    for key in mem.keys() {
+        assert!(sst.might_contain(key), "bloom must never reject a present key: {}", key);
+    }
+
+    // A clearly-absent key still resolves correctly through the bloom-skip path.
+    assert_eq!(sst.get("definitely_missing").unwrap(), None);
+    // The deleted key is found as a tombstone (bloom did not skip it).
+    assert_eq!(sst.get("key_0123").unwrap(), Some(Entry::Tombstone));
+
+    teardown(&path);
+}
+
+// An empty table's bloom rejects everything.
+#[test]
+fn test_bloom_empty_table_rejects_all() {
+    let path = setup("bloom_empty");
+
+    let mem: BTreeMap<String, Entry> = BTreeMap::new();
+    SsTable::flush(&path, mem.iter()).unwrap();
+
+    let sst = SsTable::open(&path).unwrap();
+    assert!(!sst.might_contain("anything"));
+
+    teardown(&path);
+}
+
 // A key outside the table's range is reported absent (the table is skipped).
 #[test]
 fn test_out_of_range_key_skipped() {

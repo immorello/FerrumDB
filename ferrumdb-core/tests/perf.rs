@@ -115,6 +115,36 @@ fn perf_flush() {
     teardown(&dir);
 }
 
+// Absent-key lookups against an on-disk SSTable. The bloom filter should let most
+// of these return without reading a data block. Setup uses one transaction + flush
+// so it does not pay 1000 fsyncs.
+#[test]
+fn perf_sstable_absent_read() {
+    let dir = setup("absent");
+    let mut store = Store::open_with_dir(&dir).unwrap();
+
+    let mut tx = store.begin_transaction();
+    for i in 0..N {
+        tx.set_value(format!("key_{:06}", i), Value::Integer(i as i32));
+    }
+    tx.commit().unwrap();
+    store.flush().unwrap(); // data now lives in an SSTable; memtable is empty
+
+    let start = Instant::now();
+    for i in 0..N {
+        let _ = store.get_value(&format!("absent_{:06}", i));
+    }
+    let elapsed = start.elapsed();
+
+    let ops_per_sec = N as f64 / elapsed.as_secs_f64();
+    println!(
+        "\n[absent read]{} missing-key SSTable lookups in {:>8.2?}  →  {:>10.0} lookups/sec  (bloom skip)",
+        N, elapsed, ops_per_sec
+    );
+
+    teardown(&dir);
+}
+
 // Batched transaction — N writes, one fsync. Shows the real benefit of COMMIT.
 #[test]
 fn perf_batched_transaction() {

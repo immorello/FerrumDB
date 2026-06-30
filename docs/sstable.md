@@ -8,7 +8,8 @@ This document specifies the SSTable (Sorted String Table) format and read/write 
 - ✅ **Flush wiring** — `Store::flush` writes the memtable to a new SSTable and clears the WAL; an automatic flush fires when the memtable exceeds a threshold. Reads consult the memtable, then SSTables newest→oldest. The snapshot mechanism has been replaced by flush.
 - ✅ **Buffer manager** — the flush threshold is a **byte budget** (memtable live size), tunable per table via `Store::set_memtable_budget`, not an entry count. Each SSTable stores its min/max key so a point lookup **skips** any table whose range cannot contain the key.
 - ✅ **Compaction** — `Store::compact` merges all SSTables into one (newest value per key, tombstones dropped); runs automatically once the SSTable count exceeds a threshold. The merged table is fsynced before the old files are removed.
-- ⬜ **Bloom filters, block cache** — read-path optimizations, a later step.
+- ✅ **Bloom filter** (format v3) — a per-table membership filter persisted in the file and loaded into RAM on open. A lookup for a key the table does not contain returns without reading any block.
+- ⬜ **Block cache** — read-path optimization, a later step.
 
 The format is fixed deliberately and up front, because a file format is a forever decision: once FerrumDB writes `.sst` files to a device, the reader must be able to load them for the life of that data.
 
@@ -65,6 +66,7 @@ An SSTable file has three regions, written in this order:
 │ INDEX REGION                                   │
 │   sparse index: one entry per data block       │
 │   key range: min_key, max_key  (v2)            │
+│   bloom filter: k, bit-length, bits  (v3)      │
 ├──────────────────────────────────────────────┤
 │ FOOTER  (fixed 28 bytes)                        │
 │   index_offset · index_len · entry_count       │
@@ -152,6 +154,23 @@ Immediately after the index entries, a non-empty table stores its overall key ra
 
 This lives inside the index region (it is covered by `index_len`), so the reader loads it in the same read as the index. With it, a point lookup whose key is `< min_key` or `> max_key` returns immediately without touching a data block — the table is skipped. An empty table writes no key range.
 
+### Bloom filter (format v3)
+
+After the key range, a non-empty table stores a bloom filter over **every** key it holds (values and tombstones alike):
+
+```
+┌────────────┬────────────┬───────────────┐
+│ k          │ bit_length │ bits          │
+│ u32        │ u32        │ bit_length B  │
+└────────────┴────────────┴───────────────┘
+```
+
+A bloom filter is a bit array probed by `k` hash functions. A lookup hashes the key the same `k` ways: if any of those bits is 0 the key is **definitely absent** and the table is skipped with no block read; if all are 1 the key is *probably* present and the lookup proceeds. It is sized at ~10 bits/key with `k = 7` (≈1% false-positive rate), and the hashing uses double hashing over a single in-crate FNV-1a 64-bit hash — no new dependency, matching the block CRC.
+
+The filter must include tombstone keys: a lookup for a deleted key has to find the tombstone (and stop), not be told the key is absent and fall through to an older table that still holds the old value.
+
+The bloom filter and the key range are written together — both present for a non-empty table, both absent for an empty one — so the reader parses them as a pair when there are bytes after the index entries.
+
 ---
 
 ## Footer Format
@@ -169,7 +188,7 @@ The footer is a fixed **28 bytes** at the very end of the file:
 - **index_len** — byte length of the index region.
 - **entry_count** — number of index entries (= number of data blocks).
 - **magic** — the ASCII bytes `FSST` (`0x46 0x53 0x53 0x54`). Confirms the file really is a FerrumDB SSTable before any other byte is trusted.
-- **version** — format version, currently `2` (v2 added the key range after the index). A reader rejects a version it does not recognize.
+- **version** — format version, currently `3` (v2 added the key range, v3 the bloom filter, both after the index). A reader rejects a version it does not recognize.
 
 Because the footer is fixed-size and last, the reader's first action is `seek(file_size - 28)`, read 28 bytes, check magic and version, then use `index_offset`/`index_len` to load the index.
 
@@ -196,6 +215,8 @@ get(key)
   │      miss          → continue
   │
   └─ 2. for each SSTable, newest → oldest:
+         ├─ skip if key is outside [min_key, max_key]      (no disk read)
+         ├─ skip if the bloom filter says key is absent     (no disk read)
          ├─ binary-search the in-RAM sparse index
          │     → the block whose first_key is the largest ≤ key
          ├─ seek + read that one block (offset, len from index)
@@ -208,7 +229,7 @@ get(key)
          └─ exhausted all SSTables → return None
 ```
 
-The cost of a point lookup is: one in-memory binary search per SSTable, plus at most one 4 KB block read per SSTable. A future bloom filter per SSTable would skip the block read entirely when a key is definitely absent.
+The cost of a point lookup is: per SSTable, two in-RAM checks (key range, then bloom filter) that often avoid touching the disk at all; only if both pass does it do one in-memory binary search and at most one 4 KB block read. Absent-key lookups against on-disk SSTables run at roughly in-memory speed because the bloom filter rejects them before any block read.
 
 ---
 
@@ -272,7 +293,6 @@ The new table is fsynced **before** the old files are removed. A crash in betwee
 
 These are deliberately left for later steps so the first SSTable implementation stays tractable:
 
-- **Bloom filters** — per-SSTable membership filters to skip block reads for absent keys.
 - **Block cache** — keeping hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
 - **Configurable block size** — `BLOCK_SIZE` is a hardcoded `const` (4096) for now. It becomes a `Config` field only when a second knob justifies a config struct.
 - **Secondary indexes** — a separate parallel set of SSTables mapping value → key. Not meaningful until values become structured rather than scalar.

@@ -97,6 +97,7 @@ Measured on an Apple Mac mini (APFS), 1000-key workloads:
 | Single durable write | ~107/sec | ~100/sec | `fsync` (~9–10 ms/commit) |
 | Batched transaction (1000 writes, 1 fsync) | ~950/sec | ~1,200/sec | per-append CPU + one write syscall |
 | Read (in-memory) | ~0.5M/sec | ~0.9–1.9M/sec | CPU |
+| Absent-key read (on-disk SSTable) | — | ~5M/sec | CPU (bloom skip) |
 | Recovery (WAL replay) | ~70–150k/sec | ~180–250k/sec | CPU |
 | Flush 1000 entries → SSTable | ~21 ms | ~15 ms | CPU |
 
@@ -110,7 +111,7 @@ Reads are currently served from the in-memory memtable. Once data ages into SSTa
 The memtable is flushed to immutable on-disk SSTables, which is what bounds memory on constrained devices. Each SSTable (`ferrumdb-core/src/sstable.rs`) is ~4 KB data blocks each protected by a CRC32, a sparse index (one entry per block), and a fixed footer carrying a magic number and format version. A reader loads only the footer and sparse index into RAM, then serves a point lookup with a single binary search and one block read. Full byte-level spec in [docs/sstable.md](docs/sstable.md).
 
 - **Flush** — `Store::flush()` writes the whole memtable to a new SSTable, then clears the memtable and the WAL. An automatic flush fires once the memtable's live size passes a **byte budget** (tunable per table via `set_memtable_budget`), so memory stays bounded regardless of how much is written.
-- **Layered reads** — a lookup checks the memtable first, then SSTables newest→oldest; the first hit wins. A tombstone in a newer layer shadows an older value. Each SSTable records its **key range**, so a lookup skips any table that cannot contain the key without touching the disk.
+- **Layered reads** — a lookup checks the memtable first, then SSTables newest→oldest; the first hit wins. A tombstone in a newer layer shadows an older value. Before any disk read, each SSTable is skipped if the key is outside its **key range** or rejected by its **bloom filter** — both checks are in RAM.
 - **Crash safety** — the SSTable is fsynced before the WAL is cleared, so a crash in between is safe (the WAL entries simply replay on top of the SSTable).
 
 SSTable flush replaces the earlier snapshot mechanism as the single path to disk.
@@ -130,10 +131,10 @@ Integration tests cover nine areas:
 - `tests/store.rs` — sorted iteration, sorted order after WAL replay, data survives flush and recovery, set/get/delete correctness, idempotent delete, overwrite stability
 - `tests/lock.rs` — double-open rejection, lock release on drop, per-table isolation, LOCK file creation, multi-cycle reacquisition
 - `tests/transaction.rs` — commit visibility, rollback on drop, crash recovery of committed transactions, uncommitted entry discard, mixed put/delete transactions
-- `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table, key-range reporting and out-of-range skip
+- `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table, key-range reporting and out-of-range skip, bloom-filter no-false-negatives and empty-table rejection
 - `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, byte-budget auto-flush bounds the memtable
 - `tests/compaction.rs` — merge into one, newest value wins, deleted keys dropped, all-deleted leaves nothing, compaction survives recovery, auto-compaction bounds the SSTable count
-- `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, WAL replay time, flush time
+- `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, absent-key SSTable read (bloom), WAL replay time, flush time
 
 ---
 
@@ -166,7 +167,7 @@ SSTable flush is what makes FerrumDB viable on memory-constrained embedded devic
 The fundamentals are in place; the goal here is to make the engine as fast as it can be *before* an API freezes the hot paths.
 
 - ✅ **WAL file-handle reuse** — the WAL holds its append handle open for its lifetime instead of reopening the log on every append. This took batched writes from ~190 to ~1,200/sec (6×) and also sped up single writes (they no longer pay two file opens on top of the fsync). The recovery path also now truncates any uncommitted tail so a later commit cannot adopt a crashed session's writes.
-- ⬜ **Bloom filters** — a per-SSTable membership filter (persisted in the file) to skip block reads for keys that are definitely absent.
+- ✅ **Bloom filters** — a per-SSTable membership filter (persisted in the file, format v3) that skips block reads for keys definitely absent. Absent-key lookups against on-disk SSTables run at ~in-memory speed (~5M/sec on the Mac mini) because they never touch the disk.
 - ⬜ **Block cache** — keep hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
 
 *Group commit was considered and deferred:* it batches independent concurrent commits into one fsync, which needs a multi-threaded writer. FerrumDB is intentionally single-writer, and an explicit transaction already provides "many writes, one fsync," so group commit adds complexity without fitting the model.
