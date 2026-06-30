@@ -121,6 +121,32 @@ fn test_crc_detects_corruption() {
     teardown(&path);
 }
 
+// A read populates the block cache, and repeated reads stay correct (cache hits).
+#[test]
+fn test_block_cache_populates_and_serves() {
+    let path = setup("block_cache");
+
+    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    for i in 0..100 {
+        mem.insert(format!("key_{:03}", i), Entry::Value(Value::Integer(i)));
+    }
+    SsTable::flush(&path, mem.iter()).unwrap();
+
+    let sst = SsTable::open(&path).unwrap();
+    assert_eq!(sst.cached_blocks(), 0, "cache starts empty");
+
+    // First read loads the block into the cache.
+    assert_eq!(sst.get("key_050").unwrap(), Some(Entry::Value(Value::Integer(50))));
+    assert!(sst.cached_blocks() >= 1, "a read must populate the block cache");
+
+    // Every key still resolves correctly, now served from the cache.
+    for i in 0..100 {
+        assert_eq!(sst.get(&format!("key_{:03}", i)).unwrap(), Some(Entry::Value(Value::Integer(i))));
+    }
+
+    teardown(&path);
+}
+
 // An empty memtable still produces a valid, openable file with no blocks.
 #[test]
 fn test_empty_sstable() {

@@ -145,6 +145,35 @@ fn perf_sstable_absent_read() {
     teardown(&dir);
 }
 
+// Present-key lookups against an on-disk SSTable. The first read of each block
+// hits the disk; the rest are served from the block cache.
+#[test]
+fn perf_sstable_present_read() {
+    let dir = setup("present");
+    let mut store = Store::open_with_dir(&dir).unwrap();
+
+    let mut tx = store.begin_transaction();
+    for i in 0..N {
+        tx.set_value(format!("key_{:06}", i), Value::Integer(i as i32));
+    }
+    tx.commit().unwrap();
+    store.flush().unwrap(); // data now lives in an SSTable; memtable is empty
+
+    let start = Instant::now();
+    for i in 0..N {
+        let _ = store.get_value(&format!("key_{:06}", i));
+    }
+    let elapsed = start.elapsed();
+
+    let ops_per_sec = N as f64 / elapsed.as_secs_f64();
+    println!(
+        "\n[present read]{} present-key SSTable lookups in {:>8.2?}  →  {:>10.0} lookups/sec  (block cache)",
+        N, elapsed, ops_per_sec
+    );
+
+    teardown(&dir);
+}
+
 // Batched transaction — N writes, one fsync. Shows the real benefit of COMMIT.
 #[test]
 fn perf_batched_transaction() {

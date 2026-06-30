@@ -9,7 +9,7 @@ This document specifies the SSTable (Sorted String Table) format and read/write 
 - ✅ **Buffer manager** — the flush threshold is a **byte budget** (memtable live size), tunable per table via `Store::set_memtable_budget`, not an entry count. Each SSTable stores its min/max key so a point lookup **skips** any table whose range cannot contain the key.
 - ✅ **Compaction** — `Store::compact` merges all SSTables into one (newest value per key, tombstones dropped); runs automatically once the SSTable count exceeds a threshold. The merged table is fsynced before the old files are removed.
 - ✅ **Bloom filter** (format v3) — a per-table membership filter persisted in the file and loaded into RAM on open. A lookup for a key the table does not contain returns without reading any block.
-- ⬜ **Block cache** — read-path optimization, a later step.
+- ✅ **Block cache** — a small per-table LRU of decoded data blocks, so repeated reads of hot blocks avoid the disk. The in-block scan compares key bytes without allocating, decoding a value only on a hit.
 
 The format is fixed deliberately and up front, because a file format is a forever decision: once FerrumDB writes `.sst` files to a device, the reader must be able to load them for the life of that data.
 
@@ -229,7 +229,9 @@ get(key)
          └─ exhausted all SSTables → return None
 ```
 
-The cost of a point lookup is: per SSTable, two in-RAM checks (key range, then bloom filter) that often avoid touching the disk at all; only if both pass does it do one in-memory binary search and at most one 4 KB block read. Absent-key lookups against on-disk SSTables run at roughly in-memory speed because the bloom filter rejects them before any block read.
+The cost of a point lookup is: per SSTable, two in-RAM checks (key range, then bloom filter) that often avoid touching the disk at all; only if both pass does it do one in-memory binary search and at most one block read — and that block read is served from a small per-table LRU **block cache** when the block is hot. The in-block scan compares key bytes in place without allocating, decoding a value only on a match.
+
+Absent-key lookups against on-disk SSTables run at roughly in-memory speed (the bloom rejects them before any block read). Present-key lookups are bounded by the linear scan within a block; an intra-block index (restart points) would make them faster still, and is a candidate for later.
 
 ---
 
@@ -293,7 +295,7 @@ The new table is fsynced **before** the old files are removed. A crash in betwee
 
 These are deliberately left for later steps so the first SSTable implementation stays tractable:
 
-- **Block cache** — keeping hot SSTable blocks in memory so reads that miss the memtable do not always hit disk.
+- **Intra-block index** — restart points / binary search within a block, so a present-key lookup does not linearly scan the block.
 - **Configurable block size** — `BLOCK_SIZE` is a hardcoded `const` (4096) for now. It becomes a `Config` field only when a second knob justifies a config struct.
 - **Secondary indexes** — a separate parallel set of SSTables mapping value → key. Not meaningful until values become structured rather than scalar.
 - **Compression** — block compression (e.g. LZ4) trades CPU for disk space. Easy to add later as a per-block flag.

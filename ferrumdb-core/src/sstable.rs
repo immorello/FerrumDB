@@ -15,6 +15,9 @@
 //! index, the index is loaded into RAM, and from then on any key is found with
 //! one binary search plus a single block read.
 
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +44,10 @@ const VERSION: u32 = 3;
 
 /// Fixed footer size: index_offset(8) + index_len(8) + entry_count(4) + magic(4) + version(4).
 const FOOTER_LEN: usize = 28;
+
+/// Number of decoded data blocks each SSTable keeps cached in memory. At ~4 KB a
+/// block, 32 blocks is ~128 KB per table — small, and bounded across the table set.
+const BLOCK_CACHE_CAP: usize = 32;
 
 /// Record type tag inside a data block.
 const TYPE_VALUE: u8 = 0;
@@ -73,6 +80,52 @@ pub struct SsTable {
     // Membership filter over every key in the table. `None` only for an empty
     // table. Lets a lookup skip a table that is in range but lacks the key.
     bloom: Option<BloomFilter>,
+    // Recently-read, CRC-verified data blocks (record bytes), keyed by block
+    // offset. Behind a RefCell so reads (`&self`) can populate it. Blocks are
+    // immutable, so cached entries never go stale.
+    cache: RefCell<BlockCache>,
+}
+
+/// A small LRU of decoded data blocks for one SSTable.
+#[derive(Debug)]
+struct BlockCache {
+    blocks: HashMap<u64, Vec<u8>>,
+    lru: VecDeque<u64>, // front = least recently used
+    cap: usize,
+}
+
+impl BlockCache {
+    fn new(cap: usize) -> Self {
+        BlockCache { blocks: HashMap::new(), lru: VecDeque::new(), cap }
+    }
+
+    fn get(&mut self, offset: u64) -> Option<Vec<u8>> {
+        let bytes = self.blocks.get(&offset)?.clone();
+        self.touch(offset);
+        Some(bytes)
+    }
+
+    fn put(&mut self, offset: u64, bytes: Vec<u8>) {
+        if self.cap == 0 {
+            return;
+        }
+        if !self.blocks.contains_key(&offset)
+            && self.blocks.len() >= self.cap
+            && let Some(evict) = self.lru.pop_front()
+        {
+            self.blocks.remove(&evict);
+        }
+        self.blocks.insert(offset, bytes);
+        self.touch(offset);
+    }
+
+    /// Moves `offset` to the most-recently-used end.
+    fn touch(&mut self, offset: u64) {
+        if let Some(pos) = self.lru.iter().position(|&o| o == offset) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(offset);
+    }
 }
 
 /// A bloom filter: a bit array probed by `k` hash functions. A negative answer is
@@ -222,7 +275,14 @@ impl SsTable {
         f.write_all(&file).map_err(|e| AppError::IoError(e.to_string()))?;
         f.sync_all().map_err(|e| AppError::IoError(e.to_string()))?;
 
-        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key, bloom })
+        Ok(SsTable {
+            path: path.to_path_buf(),
+            index,
+            min_key,
+            max_key,
+            bloom,
+            cache: RefCell::new(BlockCache::new(BLOCK_CACHE_CAP)),
+        })
     }
 
     /// Opens an existing SSTable: reads the footer, validates it, and loads the
@@ -287,7 +347,14 @@ impl SsTable {
             (None, None, None)
         };
 
-        Ok(SsTable { path: path.to_path_buf(), index, min_key, max_key, bloom })
+        Ok(SsTable {
+            path: path.to_path_buf(),
+            index,
+            min_key,
+            max_key,
+            bloom,
+            cache: RefCell::new(BlockCache::new(BLOCK_CACHE_CAP)),
+        })
     }
 
     /// Looks up a key. Returns `None` if the key is not present in this table.
@@ -320,22 +387,9 @@ impl SsTable {
         };
         let index_entry = &self.index[pos];
 
-        // Read that one block and scan it for an exact key match. Records are
-        // sorted, so we can stop once a record key passes the target.
-        let mut f = File::open(&self.path).map_err(|e| AppError::IoError(e.to_string()))?;
-        let records = self.read_block(&mut f, index_entry)?;
-        let mut c = 0usize;
-        while c < records.len() {
-            let (rec_key, rec_entry) = decode_record(&records, &mut c)?;
-            if rec_key == key {
-                return Ok(Some(rec_entry));
-            }
-            if rec_key.as_str() > key {
-                break;
-            }
-        }
-
-        Ok(None)
+        // Read that one block (from the cache if hot) and scan it for an exact match.
+        let records = self.cached_block(index_entry)?;
+        find_in_block(&records, key)
     }
 
     /// Reads every entry in the table, in ascending key order. Used by compaction
@@ -347,9 +401,11 @@ impl SsTable {
             return Ok(out);
         }
 
+        // Bulk scan: read straight from disk, bypassing the block cache so a
+        // one-shot compaction does not evict the hot blocks of point lookups.
         let mut f = File::open(&self.path).map_err(|e| AppError::IoError(e.to_string()))?;
         for index_entry in &self.index {
-            let records = self.read_block(&mut f, index_entry)?;
+            let records = read_block_from_disk(&mut f, index_entry)?;
             let mut c = 0usize;
             while c < records.len() {
                 out.push(decode_record(&records, &mut c)?);
@@ -358,29 +414,26 @@ impl SsTable {
         Ok(out)
     }
 
-    /// Reads one data block, verifies its CRC, and returns just the record bytes
-    /// (the trailing 4-byte CRC stripped off).
-    fn read_block(&self, f: &mut File, index_entry: &IndexEntry) -> Result<Vec<u8>, AppError> {
-        f.seek(SeekFrom::Start(index_entry.block_offset))
-            .map_err(|e| AppError::IoError(e.to_string()))?;
-        let mut block = vec![0u8; index_entry.block_len as usize];
-        f.read_exact(&mut block).map_err(|e| AppError::IoError(e.to_string()))?;
-
-        let split = block.len() - 4;
-        let stored_crc = u32::from_be_bytes(block[split..].try_into().unwrap());
-        if crc32(&block[..split]) != stored_crc {
-            return Err(AppError::DecodeError(format!(
-                "SSTable block CRC mismatch at offset {}",
-                index_entry.block_offset
-            )));
+    /// Returns one block's record bytes, from the cache if present, otherwise read
+    /// from disk (and inserted into the cache).
+    fn cached_block(&self, index_entry: &IndexEntry) -> Result<Vec<u8>, AppError> {
+        if let Some(bytes) = self.cache.borrow_mut().get(index_entry.block_offset) {
+            return Ok(bytes);
         }
-        block.truncate(split);
-        Ok(block)
+        let mut f = File::open(&self.path).map_err(|e| AppError::IoError(e.to_string()))?;
+        let records = read_block_from_disk(&mut f, index_entry)?;
+        self.cache.borrow_mut().put(index_entry.block_offset, records.clone());
+        Ok(records)
     }
 
     /// Number of data blocks (= sparse index entries). Useful for tests.
     pub fn block_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Number of data blocks currently held in the in-memory block cache.
+    pub fn cached_blocks(&self) -> usize {
+        self.cache.borrow().blocks.len()
     }
 
     /// The table's `(min_key, max_key)` range, or `None` if the table is empty.
@@ -424,6 +477,56 @@ fn encode_record(out: &mut Vec<u8>, key: &str, entry: &Entry) {
             write_u32(out, 0);
         }
     }
+}
+
+/// Reads one data block from disk, verifies its CRC, and returns just the record
+/// bytes (the trailing 4-byte CRC stripped off).
+fn read_block_from_disk(f: &mut File, index_entry: &IndexEntry) -> Result<Vec<u8>, AppError> {
+    f.seek(SeekFrom::Start(index_entry.block_offset))
+        .map_err(|e| AppError::IoError(e.to_string()))?;
+    let mut block = vec![0u8; index_entry.block_len as usize];
+    f.read_exact(&mut block).map_err(|e| AppError::IoError(e.to_string()))?;
+
+    let split = block.len() - 4;
+    let stored_crc = u32::from_be_bytes(block[split..].try_into().unwrap());
+    if crc32(&block[..split]) != stored_crc {
+        return Err(AppError::DecodeError(format!(
+            "SSTable block CRC mismatch at offset {}",
+            index_entry.block_offset
+        )));
+    }
+    block.truncate(split);
+    Ok(block)
+}
+
+/// Scans a block's record bytes for an exact key match, returning the resolved
+/// entry. Compares key bytes in place (no allocation) and decodes the value only
+/// on a hit. Records are sorted, so the scan stops once it passes the target.
+fn find_in_block(records: &[u8], key: &str) -> Result<Option<Entry>, AppError> {
+    let target = key.as_bytes();
+    let mut c = 0usize;
+    while c < records.len() {
+        let key_len = read_u32(records, &mut c)? as usize;
+        let rec_key = read_bytes(records, &mut c, key_len)?;
+        let rec_type = read_u8(records, &mut c)?;
+        let val_len = read_u32(records, &mut c)? as usize;
+        let val_bytes = read_bytes(records, &mut c, val_len)?;
+
+        match rec_key.cmp(target) {
+            Ordering::Equal => {
+                return if rec_type == TYPE_VALUE {
+                    let msg = ValueMessage::decode(val_bytes)
+                        .map_err(|e| AppError::DecodeError(e.to_string()))?;
+                    Ok(Some(Entry::Value(Value::from_proto(&msg)?)))
+                } else {
+                    Ok(Some(Entry::Tombstone))
+                };
+            }
+            Ordering::Greater => break, // passed where the key would be
+            Ordering::Less => continue,
+        }
+    }
+    Ok(None)
 }
 
 /// Decodes one record at `*c`, advancing the cursor past it.
