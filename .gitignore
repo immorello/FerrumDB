@@ -4,8 +4,8 @@
 # Library lockfile
 Cargo.lock
 
-# Local engine data
-/data/*.pb
+# Local engine data (WAL, SSTables, locks, demo/test artifacts)
+/data/
 
 # macOS
 .DS_Store
