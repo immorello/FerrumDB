@@ -123,6 +123,49 @@ fn test_transaction_mixed_ops() {
     teardown(&dir);
 }
 
+// A transaction reads its own uncommitted writes, and committed state for others.
+#[test]
+fn test_read_your_own_writes() {
+    let dir = setup("read_your_writes");
+    let mut store = Store::open_with_dir(&dir).unwrap();
+    store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+
+    let mut tx = store.begin_transaction();
+    tx.set_value(b"b".to_vec(), Value::Integer(2));
+
+    // Sees its own uncommitted write, and the committed value for an untouched key.
+    assert_eq!(tx.get_value(b"b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(tx.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+
+    // A delete in the transaction reads as absent within it.
+    tx.delete_value(b"a".to_vec());
+    assert_eq!(tx.get_value(b"a").unwrap(), None);
+
+    tx.commit().unwrap();
+    assert_eq!(store.get_value(b"a").unwrap(), None);
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Integer(2)));
+
+    teardown(&dir);
+}
+
+// An explicit rollback discards all buffered writes.
+#[test]
+fn test_explicit_rollback_discards() {
+    let dir = setup("rollback_explicit");
+    let mut store = Store::open_with_dir(&dir).unwrap();
+    store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+
+    let mut tx = store.begin_transaction();
+    tx.set_value(b"a".to_vec(), Value::Integer(99));
+    tx.set_value(b"new".to_vec(), Value::Integer(1));
+    tx.rollback();
+
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"new").unwrap(), None);
+
+    teardown(&dir);
+}
+
 // Multiple sequential transactions each commit independently.
 #[test]
 fn test_sequential_transactions() {

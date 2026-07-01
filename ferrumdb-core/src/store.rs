@@ -23,20 +23,18 @@ const DEFAULT_MEMTABLE_MAX_BYTES: usize = 4 << 20; // 4 MiB
 /// consult per lookup; the per-SSTable key range keeps that cost low.
 const MAX_SSTABLES: usize = 8;
 
-enum TxOp {
-    Put(Vec<u8>, Value),
-    Delete(Vec<u8>),
-}
-
-/// A buffered, atomic unit of work against a single table.
+/// An interactive, atomic unit of work against a single table.
 ///
-/// All operations are held in memory until `commit()` is called. On commit,
-/// every entry is written to the WAL followed by a single COMMIT + fsync.
-/// Dropping a Transaction without committing is a silent rollback — nothing
-/// reaches disk.
+/// Writes are buffered in memory until `commit()`. Reads through the transaction
+/// see its own uncommitted writes first (read-your-writes), then fall through to
+/// the committed state. On commit, every buffered write goes to the WAL followed
+/// by a single COMMIT + fsync. Dropping the transaction — or calling `rollback()`
+/// — discards the buffer; nothing reaches disk.
 pub struct Transaction<'a> {
     store: &'a mut Store,
-    ops: Vec<TxOp>,
+    // Buffered writes: `Some(value)` is a put, `None` is a delete. A BTreeMap so a
+    // later write to a key replaces an earlier one within the transaction.
+    pending: BTreeMap<Vec<u8>, Option<Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -402,12 +400,13 @@ impl Store {
         Ok("Deleted value".to_string())
     }
 
-    /// Begins an explicit multi-write transaction.
+    /// Begins an interactive transaction.
     ///
-    /// Operations are buffered in memory and written atomically on `commit()`.
-    /// Dropping the transaction without committing discards all buffered ops.
+    /// Writes are buffered and applied atomically on `commit()`; reads through the
+    /// transaction see its own uncommitted writes. Dropping it (or `rollback()`)
+    /// discards everything.
     pub fn begin_transaction(&mut self) -> Transaction<'_> {
-        Transaction { store: self, ops: Vec::new() }
+        Transaction { store: self, pending: BTreeMap::new() }
     }
 }
 
@@ -463,38 +462,56 @@ fn entry_footprint(key: &[u8], entry: &Entry) -> usize {
 }
 
 impl<'a> Transaction<'a> {
+    /// Buffers a write, replacing any earlier buffered write for the same key.
     pub fn set_value(&mut self, key: Vec<u8>, value: Value) {
-        self.ops.push(TxOp::Put(key, value));
+        self.pending.insert(key, Some(value));
     }
 
     /// Buffers a delete. Idempotent — deleting a key that does not exist is not
-    /// an error, matching `Store::delete_value`. The delete is applied as a
-    /// tombstone when the transaction commits.
+    /// an error, matching `Store::delete_value`. Applied as a tombstone on commit.
     pub fn delete_value(&mut self, key: Vec<u8>) {
-        self.ops.push(TxOp::Delete(key));
+        self.pending.insert(key, None);
     }
 
-    /// Writes all buffered operations to the WAL, writes a COMMIT marker, fsyncs,
-    /// then applies every operation to the in-memory memtable.
-    /// A single fsync covers the entire batch.
+    /// Reads within the transaction. A key written or deleted in this transaction
+    /// resolves to its buffered state (read-your-writes); otherwise the read falls
+    /// through to the committed store.
+    pub fn get_value(&self, key: &[u8]) -> Result<Option<Value>, AppError> {
+        match self.pending.get(key) {
+            Some(Some(value)) => Ok(Some(value.clone())),
+            Some(None) => Ok(None), // deleted in this transaction
+            None => self.store.get_value(key),
+        }
+    }
+
+    /// Writes all buffered operations to the WAL, writes one COMMIT marker, fsyncs,
+    /// then applies them to the in-memory memtable. A single fsync covers the batch.
     pub fn commit(self) -> Result<(), AppError> {
-        for op in &self.ops {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        for (key, val) in &self.pending {
             self.store.sequence += 1;
-            let entry = match op {
-                TxOp::Put(k, v) => Wal::create_put_entry(k.clone(), v, self.store.sequence),
-                TxOp::Delete(k) => Wal::create_delete_entry(k.clone(), self.store.sequence),
+            let entry = match val {
+                Some(v) => Wal::create_put_entry(key.clone(), v, self.store.sequence),
+                None => Wal::create_delete_entry(key.clone(), self.store.sequence),
             };
             self.store.wal.append(&entry)?;
         }
         self.store.wal.write_commit(self.store.sequence)?;
 
-        for op in self.ops {
-            match op {
-                TxOp::Put(k, v) => self.store.memtable_insert(k, Entry::Value(v)),
-                TxOp::Delete(k) => self.store.memtable_insert(k, Entry::Tombstone),
+        for (key, val) in self.pending {
+            match val {
+                Some(v) => self.store.memtable_insert(key, Entry::Value(v)),
+                None => self.store.memtable_insert(key, Entry::Tombstone),
             }
         }
         self.store.maybe_flush()?;
         Ok(())
     }
+
+    /// Discards all buffered writes without touching disk. Equivalent to dropping
+    /// the transaction; provided so intent reads clearly at the call site.
+    pub fn rollback(self) {}
 }

@@ -178,6 +178,45 @@ fn test_scan_range_and_prefix() {
 }
 
 #[test]
+fn test_transaction_read_your_writes_then_commit() {
+    let root = setup("txn_commit");
+    let mut db = Database::open(&root).unwrap();
+    let mut t = db.table("kv").unwrap();
+    t.put(b"a", b"1").unwrap();
+
+    let mut tx = t.transaction();
+    tx.put(b"b", b"2");
+    assert_eq!(tx.get(b"b").unwrap(), Some(b"2".to_vec())); // read-your-writes
+    assert_eq!(tx.get(b"a").unwrap(), Some(b"1".to_vec())); // committed state
+    tx.delete(b"a");
+    assert_eq!(tx.get(b"a").unwrap(), None);
+    tx.commit().unwrap();
+
+    assert_eq!(t.get(b"a").unwrap(), None);
+    assert_eq!(t.get(b"b").unwrap(), Some(b"2".to_vec()));
+
+    teardown(&root);
+}
+
+#[test]
+fn test_transaction_rollback() {
+    let root = setup("txn_rollback");
+    let mut db = Database::open(&root).unwrap();
+    let mut t = db.table("kv").unwrap();
+    t.put(b"a", b"1").unwrap();
+
+    let mut tx = t.transaction();
+    tx.put(b"a", b"changed");
+    tx.put(b"new", b"x");
+    tx.rollback();
+
+    assert_eq!(t.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(t.get(b"new").unwrap(), None);
+
+    teardown(&root);
+}
+
+#[test]
 fn test_data_persists_across_reopen() {
     let root = setup("persist");
 

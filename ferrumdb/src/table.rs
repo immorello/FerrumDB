@@ -3,6 +3,7 @@ use std::ops::Bound;
 use ferrumdb_core::store::{Store, Value};
 
 use crate::error::Error;
+use crate::txn::Txn;
 
 /// A list of key/value pairs, as returned by scans.
 pub type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
@@ -57,6 +58,12 @@ impl Table<'_> {
     /// Looks up many keys, returning a value (or `None`) for each, in the same order.
     pub fn get_batch(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Error> {
         keys.iter().map(|&key| self.get(key)).collect()
+    }
+
+    /// Begins an interactive transaction: buffer writes, read your own writes, then
+    /// `commit` (atomic, one fsync) or `rollback`.
+    pub fn transaction(&mut self) -> Txn<'_> {
+        Txn { inner: self.store.begin_transaction() }
     }
 
     /// Returns every key/value pair in the table, in ascending key order.

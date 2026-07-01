@@ -27,7 +27,9 @@
 mod database;
 mod error;
 mod table;
+mod txn;
 
 pub use database::Database;
 pub use error::Error;
 pub use table::{Pairs, Table};
+pub use txn::Txn;
