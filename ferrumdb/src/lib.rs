@@ -1,6 +1,6 @@
 //! FerrumDB — an embedded key-value store.
 //!
-//! FerrumDB stores byte values under UTF-8 keys, organized into named tables, with
+//! FerrumDB stores byte values under byte keys, organized into named tables, with
 //! durable writes and crash recovery — no query language, no server. It is meant to
 //! be linked directly into an application, the way SQLite is.
 //!
@@ -21,8 +21,8 @@
 //! # Ok::<(), ferrumdb::Error>(())
 //! ```
 //!
-//! Keys are UTF-8 byte slices; values are arbitrary bytes. Batched writes are
-//! atomic and durable with a single fsync.
+//! Keys and values are arbitrary byte slices. Batched writes are atomic and
+//! durable with a single fsync.
 
 mod database;
 mod error;

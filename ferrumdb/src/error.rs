@@ -6,8 +6,6 @@ use std::fmt;
 pub enum Error {
     /// An I/O error from the underlying storage.
     Io(String),
-    /// A key was not valid UTF-8. Keys must be UTF-8 byte slices in this release.
-    InvalidKey,
     /// A table name was empty or contained a path separator.
     InvalidTableName(String),
     /// `create_table` was called for a table that already exists.
@@ -25,7 +23,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(m) => write!(f, "io error: {m}"),
-            Error::InvalidKey => write!(f, "key is not valid UTF-8"),
             Error::InvalidTableName(n) => write!(f, "invalid table name: {n}"),
             Error::TableExists(n) => write!(f, "table already exists: {n}"),
             Error::TableNotFound(n) => write!(f, "table not found: {n}"),

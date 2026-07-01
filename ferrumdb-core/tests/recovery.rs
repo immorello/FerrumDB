@@ -25,16 +25,16 @@ fn test_wal_replay_on_open() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("a".to_string(), Value::Integer(1)).unwrap();
-        store.set_value("b".to_string(), Value::Text("hello".to_string())).unwrap();
-        store.set_value("c".to_string(), Value::Boolean(true)).unwrap();
+        store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+        store.set_value(b"b".to_vec(), Value::Text("hello".to_string())).unwrap();
+        store.set_value(b"c".to_vec(), Value::Boolean(true)).unwrap();
         // No flush — the WAL is the only record.
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("b").unwrap(), Some(Value::Text("hello".to_string())));
-    assert_eq!(store.get_value("c").unwrap(), Some(Value::Boolean(true)));
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Text("hello".to_string())));
+    assert_eq!(store.get_value(b"c").unwrap(), Some(Value::Boolean(true)));
 
     teardown(&dir);
 }
@@ -45,14 +45,14 @@ fn test_delete_replayed_on_open() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("keep".to_string(), Value::Integer(10)).unwrap();
-        store.set_value("drop".to_string(), Value::Integer(99)).unwrap();
-        store.delete_value("drop").unwrap();
+        store.set_value(b"keep".to_vec(), Value::Integer(10)).unwrap();
+        store.set_value(b"drop".to_vec(), Value::Integer(99)).unwrap();
+        store.delete_value(b"drop").unwrap();
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("keep").unwrap(), Some(Value::Integer(10)));
-    assert_eq!(store.get_value("drop").unwrap(), None);
+    assert_eq!(store.get_value(b"keep").unwrap(), Some(Value::Integer(10)));
+    assert_eq!(store.get_value(b"drop").unwrap(), None);
 
     teardown(&dir);
 }
@@ -64,7 +64,7 @@ fn test_flush_clears_wal() {
     let dir = setup("flush_clears_wal");
 
     let mut store = Store::open_with_dir(&dir).unwrap();
-    store.set_value("x".to_string(), Value::Float(2.5)).unwrap();
+    store.set_value(b"x".to_vec(), Value::Float(2.5)).unwrap();
     store.flush().unwrap();
 
     let wal_entries = Wal::with_path(wal_path(&dir)).read_all().unwrap();
@@ -79,15 +79,15 @@ fn test_recovery_after_flush() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("k1".to_string(), Value::Integer(1)).unwrap();
-        store.set_value("k2".to_string(), Value::Integer(2)).unwrap();
+        store.set_value(b"k1".to_vec(), Value::Integer(1)).unwrap();
+        store.set_value(b"k2".to_vec(), Value::Integer(2)).unwrap();
         store.flush().unwrap();
         // WAL is now empty; all state lives in an SSTable.
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("k1").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("k2").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value(b"k1").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"k2").unwrap(), Some(Value::Integer(2)));
 
     teardown(&dir);
 }
@@ -98,20 +98,20 @@ fn test_recovery_sstable_plus_wal() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("a".to_string(), Value::Integer(1)).unwrap();
-        store.set_value("b".to_string(), Value::Integer(2)).unwrap();
+        store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+        store.set_value(b"b".to_vec(), Value::Integer(2)).unwrap();
         store.flush().unwrap();
         // Writes after the flush land only in the WAL.
-        store.set_value("c".to_string(), Value::Integer(3)).unwrap();
-        store.set_value("d".to_string(), Value::Integer(4)).unwrap();
+        store.set_value(b"c".to_vec(), Value::Integer(3)).unwrap();
+        store.set_value(b"d".to_vec(), Value::Integer(4)).unwrap();
         // Simulated crash — no flush.
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(2)));
-    assert_eq!(store.get_value("c").unwrap(), Some(Value::Integer(3)));
-    assert_eq!(store.get_value("d").unwrap(), Some(Value::Integer(4)));
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value(b"c").unwrap(), Some(Value::Integer(3)));
+    assert_eq!(store.get_value(b"d").unwrap(), Some(Value::Integer(4)));
 
     teardown(&dir);
 }
@@ -122,15 +122,15 @@ fn test_sequence_continues_after_open() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("x".to_string(), Value::Integer(1)).unwrap();
-        store.set_value("y".to_string(), Value::Integer(2)).unwrap();
+        store.set_value(b"x".to_vec(), Value::Integer(1)).unwrap();
+        store.set_value(b"y".to_vec(), Value::Integer(2)).unwrap();
     }
 
     // After recovery, new writes must not reuse sequence numbers. We verify this
     // indirectly: the WAL must contain entries with strictly ascending sequences.
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("z".to_string(), Value::Integer(3)).unwrap();
+        store.set_value(b"z".to_vec(), Value::Integer(3)).unwrap();
     }
 
     let entries = Wal::with_path(wal_path(&dir)).read_all().unwrap();
@@ -158,15 +158,15 @@ fn test_tombstone_shadows_across_sstables() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("x".to_string(), Value::Integer(5)).unwrap();
+        store.set_value(b"x".to_vec(), Value::Integer(5)).unwrap();
         store.flush().unwrap(); // sstable_1: x = 5
-        store.delete_value("x").unwrap();
+        store.delete_value(b"x").unwrap();
         store.flush().unwrap(); // sstable_2: x = tombstone
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
     assert_eq!(
-        store.get_value("x").unwrap(),
+        store.get_value(b"x").unwrap(),
         None,
         "a newer tombstone SSTable must shadow an older value SSTable"
     );
@@ -183,15 +183,15 @@ fn test_wal_delete_shadows_sstable_value() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("x".to_string(), Value::Integer(5)).unwrap();
+        store.set_value(b"x".to_vec(), Value::Integer(5)).unwrap();
         store.flush().unwrap(); // sstable_1: x = 5
-        store.delete_value("x").unwrap(); // WAL DELETE only, no flush
+        store.delete_value(b"x").unwrap(); // WAL DELETE only, no flush
         // Simulated crash.
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
     assert_eq!(
-        store.get_value("x").unwrap(),
+        store.get_value(b"x").unwrap(),
         None,
         "a committed WAL delete must shadow the SSTable value on recovery"
     );
@@ -208,29 +208,29 @@ fn test_uncommitted_tail_not_adopted_by_later_commit() {
     // A normal committed write.
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("committed".to_string(), Value::Integer(1)).unwrap();
+        store.set_value(b"committed".to_vec(), Value::Integer(1)).unwrap();
     }
 
     // Simulate a crash that left an uncommitted PUT in the WAL (no COMMIT after).
     {
         let mut raw = Wal::with_path(wal_path(&dir));
-        let ghost = Wal::create_put_entry("ghost".to_string(), &Value::Integer(99), 50);
+        let ghost = Wal::create_put_entry(b"ghost".to_vec(), &Value::Integer(99), 50);
         raw.append(&ghost).unwrap();
     }
 
     // Reopen (truncates the uncommitted tail), then commit a brand-new write.
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        assert_eq!(store.get_value("ghost").unwrap(), None, "uncommitted entry must not survive reopen");
-        store.set_value("after".to_string(), Value::Integer(2)).unwrap();
+        assert_eq!(store.get_value(b"ghost").unwrap(), None, "uncommitted entry must not survive reopen");
+        store.set_value(b"after".to_vec(), Value::Integer(2)).unwrap();
     }
 
     // The ghost must still be absent — session 2's COMMIT must not have adopted it.
     {
         let store = Store::open_with_dir(&dir).unwrap();
-        assert_eq!(store.get_value("ghost").unwrap(), None, "uncommitted entry must never be resurrected");
-        assert_eq!(store.get_value("committed").unwrap(), Some(Value::Integer(1)));
-        assert_eq!(store.get_value("after").unwrap(), Some(Value::Integer(2)));
+        assert_eq!(store.get_value(b"ghost").unwrap(), None, "uncommitted entry must never be resurrected");
+        assert_eq!(store.get_value(b"committed").unwrap(), Some(Value::Integer(1)));
+        assert_eq!(store.get_value(b"after").unwrap(), Some(Value::Integer(2)));
     }
 
     teardown(&dir);

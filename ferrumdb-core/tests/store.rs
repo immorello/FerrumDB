@@ -17,11 +17,11 @@ fn test_keys_iterated_in_sorted_order() {
     let dir = setup("sorted_iteration");
 
     let mut store = Store::open_with_dir(&dir).unwrap();
-    store.set_value("zebra".to_string(), Value::Integer(3)).unwrap();
-    store.set_value("apple".to_string(), Value::Integer(1)).unwrap();
-    store.set_value("mango".to_string(), Value::Integer(2)).unwrap();
+    store.set_value(b"zebra".to_vec(), Value::Integer(3)).unwrap();
+    store.set_value(b"apple".to_vec(), Value::Integer(1)).unwrap();
+    store.set_value(b"mango".to_vec(), Value::Integer(2)).unwrap();
 
-    let keys: Vec<&String> = store.get_data().keys().collect();
+    let keys: Vec<String> = store.get_data().keys().map(|k| String::from_utf8_lossy(k).into_owned()).collect();
     assert_eq!(keys, vec!["apple", "mango", "zebra"]);
 
     teardown(&dir);
@@ -33,13 +33,13 @@ fn test_sorted_order_survives_recovery() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("c".to_string(), Value::Integer(3)).unwrap();
-        store.set_value("a".to_string(), Value::Integer(1)).unwrap();
-        store.set_value("b".to_string(), Value::Integer(2)).unwrap();
+        store.set_value(b"c".to_vec(), Value::Integer(3)).unwrap();
+        store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+        store.set_value(b"b".to_vec(), Value::Integer(2)).unwrap();
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    let keys: Vec<&String> = store.get_data().keys().collect();
+    let keys: Vec<String> = store.get_data().keys().map(|k| String::from_utf8_lossy(k).into_owned()).collect();
     assert_eq!(keys, vec!["a", "b", "c"]);
 
     teardown(&dir);
@@ -53,18 +53,18 @@ fn test_data_survives_flush_and_recovery() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("z".to_string(), Value::Integer(26)).unwrap();
-        store.set_value("a".to_string(), Value::Integer(1)).unwrap();
-        store.set_value("m".to_string(), Value::Integer(13)).unwrap();
+        store.set_value(b"z".to_vec(), Value::Integer(26)).unwrap();
+        store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+        store.set_value(b"m".to_vec(), Value::Integer(13)).unwrap();
         store.flush().unwrap(); // z, a, m -> SSTable; memtable cleared
-        store.set_value("f".to_string(), Value::Integer(6)).unwrap(); // memtable + WAL
+        store.set_value(b"f".to_vec(), Value::Integer(6)).unwrap(); // memtable + WAL
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("f").unwrap(), Some(Value::Integer(6)));
-    assert_eq!(store.get_value("m").unwrap(), Some(Value::Integer(13)));
-    assert_eq!(store.get_value("z").unwrap(), Some(Value::Integer(26)));
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"f").unwrap(), Some(Value::Integer(6)));
+    assert_eq!(store.get_value(b"m").unwrap(), Some(Value::Integer(13)));
+    assert_eq!(store.get_value(b"z").unwrap(), Some(Value::Integer(26)));
 
     teardown(&dir);
 }
@@ -75,15 +75,15 @@ fn test_set_get_delete() {
 
     let mut store = Store::open_with_dir(&dir).unwrap();
 
-    store.set_value("key".to_string(), Value::Text("value".to_string())).unwrap();
-    assert_eq!(store.get_value("key").unwrap(), Some(Value::Text("value".to_string())));
+    store.set_value(b"key".to_vec(), Value::Text("value".to_string())).unwrap();
+    assert_eq!(store.get_value(b"key").unwrap(), Some(Value::Text("value".to_string())));
 
-    store.delete_value("key").unwrap();
-    assert_eq!(store.get_value("key").unwrap(), None);
+    store.delete_value(b"key").unwrap();
+    assert_eq!(store.get_value(b"key").unwrap(), None);
 
     // Delete is idempotent: deleting an already-deleted key is not an error.
-    store.delete_value("key").unwrap();
-    assert_eq!(store.get_value("key").unwrap(), None);
+    store.delete_value(b"key").unwrap();
+    assert_eq!(store.get_value(b"key").unwrap(), None);
 
     teardown(&dir);
 }
@@ -93,13 +93,13 @@ fn test_overwrite_keeps_sorted_order() {
     let dir = setup("overwrite_sorted");
 
     let mut store = Store::open_with_dir(&dir).unwrap();
-    store.set_value("b".to_string(), Value::Integer(1)).unwrap();
-    store.set_value("a".to_string(), Value::Integer(2)).unwrap();
-    store.set_value("b".to_string(), Value::Integer(99)).unwrap();
+    store.set_value(b"b".to_vec(), Value::Integer(1)).unwrap();
+    store.set_value(b"a".to_vec(), Value::Integer(2)).unwrap();
+    store.set_value(b"b".to_vec(), Value::Integer(99)).unwrap();
 
-    let keys: Vec<&String> = store.get_data().keys().collect();
+    let keys: Vec<String> = store.get_data().keys().map(|k| String::from_utf8_lossy(k).into_owned()).collect();
     assert_eq!(keys, vec!["a", "b"]);
-    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(99)));
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Integer(99)));
 
     teardown(&dir);
 }

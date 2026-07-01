@@ -17,26 +17,26 @@ fn test_append_and_read_entries() {
 
     // Test 1: Append PUT entries
     let entry1 = Wal::create_put_entry(
-        "user_1".to_string(),
+        b"user_1".to_vec(),
         &Value::Integer(42),
         1
     );
     wal.append(&entry1).expect("Failed to append entry 1");
 
     let entry2 = Wal::create_put_entry(
-        "name".to_string(),
+        b"name".to_vec(),
         &Value::Text("FerrumDB".to_string()),
         2
     );
     wal.append(&entry2).expect("Failed to append entry 2");
 
     // Test DELETE entry
-    let entry3 = Wal::create_delete_entry("user_1".to_string(), 3);
+    let entry3 = Wal::create_delete_entry(b"user_1".to_vec(), 3);
     wal.append(&entry3).expect("Failed to append entry 3");
 
     // Test Float
     let entry4 = Wal::create_put_entry(
-        "price".to_string(),
+        b"price".to_vec(),
         &Value::Float(19.99),
         4
     );
@@ -44,7 +44,7 @@ fn test_append_and_read_entries() {
 
     // Test Boolean
     let entry5 = Wal::create_put_entry(
-        "active".to_string(),
+        b"active".to_vec(),
         &Value::Boolean(true),
         5
     );
@@ -56,27 +56,27 @@ fn test_append_and_read_entries() {
     assert_eq!(entries.len(), 5, "Should have 5 entries");
     
     // Verify first entry
-    assert_eq!(entries[0].key, "user_1");
+    assert_eq!(entries[0].key, b"user_1");
     assert_eq!(entries[0].operation(), Operation::Put);
     assert_eq!(entries[0].sequence, 1);
     
     // Verify second entry
-    assert_eq!(entries[1].key, "name");
+    assert_eq!(entries[1].key, b"name");
     assert_eq!(entries[1].operation(), Operation::Put);
     assert_eq!(entries[1].sequence, 2);
     
     // Verify third entry (DELETE)
-    assert_eq!(entries[2].key, "user_1");
+    assert_eq!(entries[2].key, b"user_1");
     assert_eq!(entries[2].operation(), Operation::Delete);
     assert_eq!(entries[2].sequence, 3);
     
     // Verify fourth entry
-    assert_eq!(entries[3].key, "price");
+    assert_eq!(entries[3].key, b"price");
     assert_eq!(entries[3].operation(), Operation::Put);
     assert_eq!(entries[3].sequence, 4);
     
     // Verify fifth entry
-    assert_eq!(entries[4].key, "active");
+    assert_eq!(entries[4].key, b"active");
     assert_eq!(entries[4].operation(), Operation::Put);
     assert_eq!(entries[4].sequence, 5);
     
@@ -98,7 +98,7 @@ fn test_wal_persistence() {
     {
         let mut wal = Wal::with_path(test_path);
         let entry = Wal::create_put_entry(
-            "test_key".to_string(),
+            b"test_key".to_vec(),
             &Value::Integer(123),
             1
         );
@@ -110,7 +110,7 @@ fn test_wal_persistence() {
     let entries = wal.read_all().expect("Failed to read");
     
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].key, "test_key");
+    assert_eq!(entries[0].key, b"test_key");
     assert_eq!(entries[0].sequence, 1);
     
     // Clean up
@@ -131,7 +131,7 @@ fn test_wal_clear() {
 
     // Add an entry
     let entry = Wal::create_put_entry(
-        "key1".to_string(),
+        b"key1".to_vec(),
         &Value::Text("value1".to_string()),
         1
     );

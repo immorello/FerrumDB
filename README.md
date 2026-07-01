@@ -4,7 +4,7 @@
 
 # FerrumDB
 
-FerrumDB is an embedded, no-SQL key-value storage engine written in Rust. It stores byte values under UTF-8 keys, organized into named tables, with durable writes and crash recovery — without a query language and without a server. It is meant to be linked directly into an application, the way SQLite is.
+FerrumDB is an embedded, no-SQL key-value storage engine written in Rust. It stores byte values under byte keys, organized into named tables, with durable writes and crash recovery — without a query language and without a server. It is meant to be linked directly into an application, the way SQLite is.
 
 The target is the space that SQLite owns for relational data, applied to key-value workloads: IoT devices, edge nodes, mobile applications, and local-first software that needs a lightweight but correct persistent store.
 
@@ -12,7 +12,7 @@ The target is the space that SQLite owns for relational data, applied to key-val
 
 ## Usage (Rust)
 
-The public API lives in the `ferrumdb` crate (the `ferrumdb-core` crate is the engine it wraps). Keys are UTF-8 byte slices; values are arbitrary bytes.
+The public API lives in the `ferrumdb` crate (the `ferrumdb-core` crate is the engine it wraps). Keys and values are arbitrary byte slices.
 
 ```rust
 use ferrumdb::Database;
@@ -202,9 +202,9 @@ The fundamentals are in place; the goal here was to make the engine as fast as i
 
 ### Step 5 — API layer (in progress)
 
-- ✅ A minimal public Rust API (`ferrumdb` crate): a `Database` handle managing named tables, and a `Table` with byte `put`/`get`/`delete`/`contains` and atomic `put_batch`/`get_batch`. Keys are UTF-8, values are arbitrary bytes.
+- ✅ A minimal public Rust API (`ferrumdb` crate): a `Database` handle managing named tables, and a `Table` with byte `put`/`get`/`delete`/`contains` and atomic `put_batch`/`get_batch`. Keys and values are arbitrary bytes.
+- ✅ Arbitrary binary keys — keys are `Vec<u8>` throughout the engine (memtable, WAL, SSTable), sorted lexicographically.
 - ⬜ Range scans and interactive multi-operation transactions (needs a cross-SSTable merge iterator).
-- ⬜ Arbitrary binary keys (currently UTF-8) — a `String → Vec<u8>` engine change, deferred until needed.
 - ⬜ A C FFI layer (`cdylib`) so FerrumDB can be used from C, Swift, and other languages — the same way SQLite is embedded across ecosystems.
 - ⬜ Python bindings (via the C layer or PyO3).
 

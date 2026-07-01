@@ -36,13 +36,13 @@ fn test_lock_released_on_drop() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("k".to_string(), Value::Integer(1)).unwrap();
+        store.set_value(b"k".to_vec(), Value::Integer(1)).unwrap();
         // store dropped here — lock released
     }
 
     // Must succeed: lock is no longer held
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("k").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"k").unwrap(), Some(Value::Integer(1)));
 
     teardown(&dir);
 }
@@ -56,11 +56,11 @@ fn test_different_tables_open_simultaneously() {
     let mut store_a = Store::open_with_dir(&dir_a).unwrap();
     let mut store_b = Store::open_with_dir(&dir_b).unwrap();
 
-    store_a.set_value("key".to_string(), Value::Text("from_a".to_string())).unwrap();
-    store_b.set_value("key".to_string(), Value::Text("from_b".to_string())).unwrap();
+    store_a.set_value(b"key".to_vec(), Value::Text("from_a".to_string())).unwrap();
+    store_b.set_value(b"key".to_vec(), Value::Text("from_b".to_string())).unwrap();
 
-    assert_eq!(store_a.get_value("key").unwrap(), Some(Value::Text("from_a".to_string())));
-    assert_eq!(store_b.get_value("key").unwrap(), Some(Value::Text("from_b".to_string())));
+    assert_eq!(store_a.get_value(b"key").unwrap(), Some(Value::Text("from_a".to_string())));
+    assert_eq!(store_b.get_value(b"key").unwrap(), Some(Value::Text("from_b".to_string())));
 
     teardown(&dir_a);
     teardown(&dir_b);
@@ -88,14 +88,14 @@ fn test_lock_reacquired_after_multiple_cycles() {
     for i in 0..3 {
         let mut store = Store::open_with_dir(&dir)
             .unwrap_or_else(|e| panic!("cycle {} failed to open: {e:?}", i));
-        store.set_value(format!("key_{}", i), Value::Integer(i)).unwrap();
+        store.set_value(format!("key_{}", i).into_bytes(), Value::Integer(i)).unwrap();
     }
 
     // All three writes must be recoverable after three open/close cycles.
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("key_0").unwrap(), Some(Value::Integer(0)));
-    assert_eq!(store.get_value("key_1").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("key_2").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value(b"key_0").unwrap(), Some(Value::Integer(0)));
+    assert_eq!(store.get_value(b"key_1").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"key_2").unwrap(), Some(Value::Integer(2)));
 
     teardown(&dir);
 }

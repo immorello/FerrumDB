@@ -22,14 +22,14 @@ fn test_transaction_all_ops_visible_after_commit() {
     let mut store = Store::open_with_dir(&dir).unwrap();
 
     let mut tx = store.begin_transaction();
-    tx.set_value("a".to_string(), Value::Integer(1));
-    tx.set_value("b".to_string(), Value::Integer(2));
-    tx.set_value("c".to_string(), Value::Integer(3));
+    tx.set_value(b"a".to_vec(), Value::Integer(1));
+    tx.set_value(b"b".to_vec(), Value::Integer(2));
+    tx.set_value(b"c".to_vec(), Value::Integer(3));
     tx.commit().unwrap();
 
-    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(2)));
-    assert_eq!(store.get_value("c").unwrap(), Some(Value::Integer(3)));
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value(b"c").unwrap(), Some(Value::Integer(3)));
 
     teardown(&dir);
 }
@@ -39,16 +39,16 @@ fn test_transaction_all_ops_visible_after_commit() {
 fn test_transaction_rollback_on_drop() {
     let dir = setup("rollback");
     let mut store = Store::open_with_dir(&dir).unwrap();
-    store.set_value("existing".to_string(), Value::Integer(99)).unwrap();
+    store.set_value(b"existing".to_vec(), Value::Integer(99)).unwrap();
 
     {
         let mut tx = store.begin_transaction();
-        tx.set_value("new_key".to_string(), Value::Integer(1));
+        tx.set_value(b"new_key".to_vec(), Value::Integer(1));
         // Drop without commit — rollback.
     }
 
-    assert_eq!(store.get_value("existing").unwrap(), Some(Value::Integer(99)));
-    assert_eq!(store.get_value("new_key").unwrap(), None);
+    assert_eq!(store.get_value(b"existing").unwrap(), Some(Value::Integer(99)));
+    assert_eq!(store.get_value(b"new_key").unwrap(), None);
 
     teardown(&dir);
 }
@@ -61,17 +61,17 @@ fn test_transaction_survives_recovery() {
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
         let mut tx = store.begin_transaction();
-        tx.set_value("x".to_string(), Value::Integer(10));
-        tx.set_value("y".to_string(), Value::Integer(20));
-        tx.set_value("z".to_string(), Value::Integer(30));
+        tx.set_value(b"x".to_vec(), Value::Integer(10));
+        tx.set_value(b"y".to_vec(), Value::Integer(20));
+        tx.set_value(b"z".to_vec(), Value::Integer(30));
         tx.commit().unwrap();
         // Simulated crash — no flush.
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("x").unwrap(), Some(Value::Integer(10)));
-    assert_eq!(store.get_value("y").unwrap(), Some(Value::Integer(20)));
-    assert_eq!(store.get_value("z").unwrap(), Some(Value::Integer(30)));
+    assert_eq!(store.get_value(b"x").unwrap(), Some(Value::Integer(10)));
+    assert_eq!(store.get_value(b"y").unwrap(), Some(Value::Integer(20)));
+    assert_eq!(store.get_value(b"z").unwrap(), Some(Value::Integer(30)));
 
     teardown(&dir);
 }
@@ -85,20 +85,20 @@ fn test_uncommitted_entries_discarded_on_recovery() {
         let mut store = Store::open_with_dir(&dir).unwrap();
         // Write one committed transaction first.
         let mut tx = store.begin_transaction();
-        tx.set_value("committed".to_string(), Value::Integer(1));
+        tx.set_value(b"committed".to_vec(), Value::Integer(1));
         tx.commit().unwrap();
 
         // Write directly to the WAL without a COMMIT — simulates a crash mid-write.
         use ferrumdb_core::wal::Wal;
         let mut raw_wal = Wal::with_path(wal_path(&dir));
-        let entry = Wal::create_put_entry("uncommitted".to_string(), &Value::Integer(2), 99);
+        let entry = Wal::create_put_entry(b"uncommitted".to_vec(), &Value::Integer(2), 99);
         raw_wal.append(&entry).unwrap();
         // No write_commit — process "crashes" here.
     }
 
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("committed").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("uncommitted").unwrap(), None, "uncommitted entry must not survive recovery");
+    assert_eq!(store.get_value(b"committed").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"uncommitted").unwrap(), None, "uncommitted entry must not survive recovery");
 
     teardown(&dir);
 }
@@ -108,17 +108,17 @@ fn test_uncommitted_entries_discarded_on_recovery() {
 fn test_transaction_mixed_ops() {
     let dir = setup("mixed_ops");
     let mut store = Store::open_with_dir(&dir).unwrap();
-    store.set_value("to_delete".to_string(), Value::Text("bye".to_string())).unwrap();
-    store.set_value("to_keep".to_string(), Value::Text("hi".to_string())).unwrap();
+    store.set_value(b"to_delete".to_vec(), Value::Text("bye".to_string())).unwrap();
+    store.set_value(b"to_keep".to_vec(), Value::Text("hi".to_string())).unwrap();
 
     let mut tx = store.begin_transaction();
-    tx.set_value("new".to_string(), Value::Integer(42));
-    tx.delete_value("to_delete".to_string());
+    tx.set_value(b"new".to_vec(), Value::Integer(42));
+    tx.delete_value(b"to_delete".to_vec());
     tx.commit().unwrap();
 
-    assert_eq!(store.get_value("new").unwrap(), Some(Value::Integer(42)));
-    assert_eq!(store.get_value("to_delete").unwrap(), None);
-    assert_eq!(store.get_value("to_keep").unwrap(), Some(Value::Text("hi".to_string())));
+    assert_eq!(store.get_value(b"new").unwrap(), Some(Value::Integer(42)));
+    assert_eq!(store.get_value(b"to_delete").unwrap(), None);
+    assert_eq!(store.get_value(b"to_keep").unwrap(), Some(Value::Text("hi".to_string())));
 
     teardown(&dir);
 }
@@ -132,14 +132,14 @@ fn test_sequential_transactions() {
         let mut store = Store::open_with_dir(&dir).unwrap();
         for i in 0..5i32 {
             let mut tx = store.begin_transaction();
-            tx.set_value(format!("key_{}", i), Value::Integer(i));
+            tx.set_value(format!("key_{}", i).into_bytes(), Value::Integer(i));
             tx.commit().unwrap();
         }
     } // lock released here
 
     let store2 = Store::open_with_dir(&dir).unwrap();
     for i in 0..5i32 {
-        assert_eq!(store2.get_value(&format!("key_{}", i)).unwrap(), Some(Value::Integer(i)));
+        assert_eq!(store2.get_value(format!("key_{}", i).as_bytes()).unwrap(), Some(Value::Integer(i)));
     }
 
     teardown(&dir);

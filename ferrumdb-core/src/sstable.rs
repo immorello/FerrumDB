@@ -63,7 +63,7 @@ pub enum Entry {
 /// One entry in the sparse index — describes a single data block.
 #[derive(Debug, Clone)]
 struct IndexEntry {
-    first_key: String,
+    first_key: Vec<u8>,
     block_offset: u64,
     block_len: u32,
 }
@@ -75,8 +75,8 @@ pub struct SsTable {
     index: Vec<IndexEntry>,
     // Smallest and largest key in the table. `None` only for an empty table.
     // Used to skip the table entirely when a lookup key falls outside its range.
-    min_key: Option<String>,
-    max_key: Option<String>,
+    min_key: Option<Vec<u8>>,
+    max_key: Option<Vec<u8>>,
     // Membership filter over every key in the table. `None` only for an empty
     // table. Lets a lookup skip a table that is in range but lacks the key.
     bloom: Option<BloomFilter>,
@@ -148,21 +148,21 @@ impl BloomFilter {
 
     /// Bit positions for a key, via double hashing (Kirsch–Mitzenmacher): one
     /// 64-bit hash split into two, combined as h1 + i*h2.
-    fn positions(&self, key: &str) -> impl Iterator<Item = usize> + '_ {
+    fn positions(&self, key: &[u8]) -> impl Iterator<Item = usize> + '_ {
         let m = (self.bits.len() * 8) as u64;
-        let h = hash64(key.as_bytes());
+        let h = hash64(key);
         let h1 = h & 0xFFFF_FFFF;
         let h2 = (h >> 32) | 1; // force odd so it never collapses to one position
         (0..self.k as u64).map(move |i| (h1.wrapping_add(i.wrapping_mul(h2)) % m) as usize)
     }
 
-    fn add(&mut self, key: &str) {
+    fn add(&mut self, key: &[u8]) {
         for bit in self.positions(key).collect::<Vec<_>>() {
             self.bits[bit / 8] |= 1 << (bit % 8);
         }
     }
 
-    fn maybe_contains(&self, key: &str) -> bool {
+    fn maybe_contains(&self, key: &[u8]) -> bool {
         self.positions(key).all(|bit| self.bits[bit / 8] & (1 << (bit % 8)) != 0)
     }
 }
@@ -183,7 +183,7 @@ impl SsTable {
     /// iterator satisfies this).
     pub fn flush<'a, I>(path: impl AsRef<Path>, entries: I) -> Result<SsTable, AppError>
     where
-        I: Iterator<Item = (&'a String, &'a Entry)>,
+        I: Iterator<Item = (&'a Vec<u8>, &'a Entry)>,
     {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -194,16 +194,16 @@ impl SsTable {
         let mut index: Vec<IndexEntry> = Vec::new();
 
         let mut block: Vec<u8> = Vec::new();
-        let mut block_first_key: Option<String> = None;
+        let mut block_first_key: Option<Vec<u8>> = None;
         let mut block_offset: u64 = 0;
 
         // Track the table-wide key range. Keys arrive in ascending order, so the
         // first key seen is the min and the last is the max.
-        let mut min_key: Option<String> = None;
-        let mut max_key: Option<String> = None;
+        let mut min_key: Option<Vec<u8>> = None;
+        let mut max_key: Option<Vec<u8>> = None;
         // Every key, to build the bloom filter once the count is known. Holds
         // borrows into the caller's map; bounded by the memtable size.
-        let mut keys: Vec<&str> = Vec::new();
+        let mut keys: Vec<&[u8]> = Vec::new();
 
         for (key, entry) in entries {
             if min_key.is_none() {
@@ -231,16 +231,16 @@ impl SsTable {
         let index_offset = file.len() as u64;
         for e in &index {
             write_u32(&mut file, e.first_key.len() as u32);
-            file.extend_from_slice(e.first_key.as_bytes());
+            file.extend_from_slice(&e.first_key);
             file.extend_from_slice(&e.block_offset.to_be_bytes());
             write_u32(&mut file, e.block_len);
         }
         // Key range, only present for a non-empty table (min and max are Some together).
         if let (Some(min), Some(max)) = (&min_key, &max_key) {
             write_u32(&mut file, min.len() as u32);
-            file.extend_from_slice(min.as_bytes());
+            file.extend_from_slice(min);
             write_u32(&mut file, max.len() as u32);
-            file.extend_from_slice(max.as_bytes());
+            file.extend_from_slice(max);
         }
         // Bloom filter, also only for a non-empty table. Written after the key
         // range as: k (u32), bit-length (u32), bit bytes.
@@ -324,7 +324,7 @@ impl SsTable {
         let mut c = 0usize;
         for _ in 0..entry_count {
             let key_len = read_u32(&buf, &mut c)? as usize;
-            let first_key = read_string(&buf, &mut c, key_len)?;
+            let first_key = read_bytes(&buf, &mut c, key_len)?.to_vec();
             let block_offset = read_u64(&buf, &mut c)?;
             let block_len = read_u32(&buf, &mut c)?;
             index.push(IndexEntry { first_key, block_offset, block_len });
@@ -334,9 +334,9 @@ impl SsTable {
         // empty table; both present together otherwise).
         let (min_key, max_key, bloom) = if c < buf.len() {
             let min_len = read_u32(&buf, &mut c)? as usize;
-            let min = read_string(&buf, &mut c, min_len)?;
+            let min = read_bytes(&buf, &mut c, min_len)?.to_vec();
             let max_len = read_u32(&buf, &mut c)? as usize;
-            let max = read_string(&buf, &mut c, max_len)?;
+            let max = read_bytes(&buf, &mut c, max_len)?.to_vec();
 
             let k = read_u32(&buf, &mut c)?;
             let bits_len = read_u32(&buf, &mut c)? as usize;
@@ -360,14 +360,14 @@ impl SsTable {
     /// Looks up a key. Returns `None` if the key is not present in this table.
     /// A tombstone is returned as `Some(Entry::Tombstone)` — the caller decides
     /// whether that shadows older tables.
-    pub fn get(&self, key: &str) -> Result<Option<Entry>, AppError> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Entry>, AppError> {
         if self.index.is_empty() {
             return Ok(None);
         }
 
         // Skip the whole table if the key falls outside its range — no disk read.
         if let (Some(min), Some(max)) = (&self.min_key, &self.max_key)
-            && (key < min.as_str() || key > max.as_str())
+            && (key < min.as_slice() || key > max.as_slice())
         {
             return Ok(None);
         }
@@ -380,7 +380,7 @@ impl SsTable {
         }
 
         // Find the block whose first_key is the largest <= key.
-        let pos = match self.index.binary_search_by(|e| e.first_key.as_str().cmp(key)) {
+        let pos = match self.index.binary_search_by(|e| e.first_key.as_slice().cmp(key)) {
             Ok(i) => i,
             Err(0) => return Ok(None), // key precedes the first block
             Err(i) => i - 1,
@@ -395,7 +395,7 @@ impl SsTable {
     /// Reads every entry in the table, in ascending key order. Used by compaction
     /// to merge tables. Loads one block at a time, but returns all entries in
     /// memory — callers should expect O(table size) allocation.
-    pub fn read_all_entries(&self) -> Result<Vec<(String, Entry)>, AppError> {
+    pub fn read_all_entries(&self) -> Result<Vec<(Vec<u8>, Entry)>, AppError> {
         let mut out = Vec::new();
         if self.index.is_empty() {
             return Ok(out);
@@ -437,9 +437,9 @@ impl SsTable {
     }
 
     /// The table's `(min_key, max_key)` range, or `None` if the table is empty.
-    pub fn key_range(&self) -> Option<(&str, &str)> {
+    pub fn key_range(&self) -> Option<(&[u8], &[u8])> {
         match (&self.min_key, &self.max_key) {
-            (Some(min), Some(max)) => Some((min.as_str(), max.as_str())),
+            (Some(min), Some(max)) => Some((min.as_slice(), max.as_slice())),
             _ => None,
         }
     }
@@ -447,7 +447,7 @@ impl SsTable {
     /// Bloom-filter membership test: `false` means the key is definitely not in
     /// this table; `true` means it is probably present (with a small false-positive
     /// rate). An empty table returns `false` for every key.
-    pub fn might_contain(&self, key: &str) -> bool {
+    pub fn might_contain(&self, key: &[u8]) -> bool {
         match &self.bloom {
             Some(bloom) => bloom.maybe_contains(key),
             None => false,
@@ -462,9 +462,9 @@ impl SsTable {
 
 // --- record / block encoding helpers ---
 
-fn encode_record(out: &mut Vec<u8>, key: &str, entry: &Entry) {
+fn encode_record(out: &mut Vec<u8>, key: &[u8], entry: &Entry) {
     write_u32(out, key.len() as u32);
-    out.extend_from_slice(key.as_bytes());
+    out.extend_from_slice(key);
     match entry {
         Entry::Value(v) => {
             out.push(TYPE_VALUE);
@@ -502,8 +502,8 @@ fn read_block_from_disk(f: &mut File, index_entry: &IndexEntry) -> Result<Vec<u8
 /// Scans a block's record bytes for an exact key match, returning the resolved
 /// entry. Compares key bytes in place (no allocation) and decodes the value only
 /// on a hit. Records are sorted, so the scan stops once it passes the target.
-fn find_in_block(records: &[u8], key: &str) -> Result<Option<Entry>, AppError> {
-    let target = key.as_bytes();
+fn find_in_block(records: &[u8], key: &[u8]) -> Result<Option<Entry>, AppError> {
+    let target = key;
     let mut c = 0usize;
     while c < records.len() {
         let key_len = read_u32(records, &mut c)? as usize;
@@ -530,9 +530,9 @@ fn find_in_block(records: &[u8], key: &str) -> Result<Option<Entry>, AppError> {
 }
 
 /// Decodes one record at `*c`, advancing the cursor past it.
-fn decode_record(buf: &[u8], c: &mut usize) -> Result<(String, Entry), AppError> {
+fn decode_record(buf: &[u8], c: &mut usize) -> Result<(Vec<u8>, Entry), AppError> {
     let key_len = read_u32(buf, c)? as usize;
-    let key = read_string(buf, c, key_len)?;
+    let key = read_bytes(buf, c, key_len)?.to_vec();
     let rec_type = read_u8(buf, c)?;
     let val_len = read_u32(buf, c)? as usize;
 
@@ -550,7 +550,7 @@ fn finalize_block(
     file: &mut Vec<u8>,
     block: &mut Vec<u8>,
     index: &mut Vec<IndexEntry>,
-    first_key: Option<String>,
+    first_key: Option<Vec<u8>>,
     offset: u64,
 ) {
     let crc = crc32(block);
@@ -606,11 +606,6 @@ fn read_bytes<'a>(buf: &'a [u8], c: &mut usize, len: usize) -> Result<&'a [u8], 
     let s = &buf[*c..*c + len];
     *c += len;
     Ok(s)
-}
-
-fn read_string(buf: &[u8], c: &mut usize, len: usize) -> Result<String, AppError> {
-    let bytes = read_bytes(buf, c, len)?;
-    String::from_utf8(bytes.to_vec()).map_err(|e| AppError::DecodeError(e.to_string()))
 }
 
 // --- CRC32 (IEEE 802.3, polynomial 0xEDB88320) ---

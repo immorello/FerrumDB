@@ -23,20 +23,20 @@ fn teardown(path: &str) {
 fn test_flush_and_read_roundtrip() {
     let path = setup("roundtrip");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
-    mem.insert("a".to_string(), Entry::Value(Value::Integer(1)));
-    mem.insert("b".to_string(), Entry::Value(Value::Text("hello".to_string())));
-    mem.insert("c".to_string(), Entry::Value(Value::Float(2.5)));
-    mem.insert("d".to_string(), Entry::Value(Value::Boolean(true)));
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+    mem.insert(b"a".to_vec(), Entry::Value(Value::Integer(1)));
+    mem.insert(b"b".to_vec(), Entry::Value(Value::Text("hello".to_string())));
+    mem.insert(b"c".to_vec(), Entry::Value(Value::Float(2.5)));
+    mem.insert(b"d".to_vec(), Entry::Value(Value::Boolean(true)));
 
     SsTable::flush(&path, mem.iter()).unwrap();
 
     // Reopen from disk — index is loaded from the footer, not from memory.
     let sst = SsTable::open(&path).unwrap();
-    assert_eq!(sst.get("a").unwrap(), Some(Entry::Value(Value::Integer(1))));
-    assert_eq!(sst.get("b").unwrap(), Some(Entry::Value(Value::Text("hello".to_string()))));
-    assert_eq!(sst.get("c").unwrap(), Some(Entry::Value(Value::Float(2.5))));
-    assert_eq!(sst.get("d").unwrap(), Some(Entry::Value(Value::Boolean(true))));
+    assert_eq!(sst.get(b"a").unwrap(), Some(Entry::Value(Value::Integer(1))));
+    assert_eq!(sst.get(b"b").unwrap(), Some(Entry::Value(Value::Text("hello".to_string()))));
+    assert_eq!(sst.get(b"c").unwrap(), Some(Entry::Value(Value::Float(2.5))));
+    assert_eq!(sst.get(b"d").unwrap(), Some(Entry::Value(Value::Boolean(true))));
 
     teardown(&path);
 }
@@ -46,15 +46,15 @@ fn test_flush_and_read_roundtrip() {
 fn test_missing_key_returns_none() {
     let path = setup("missing");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
-    mem.insert("apple".to_string(), Entry::Value(Value::Integer(1)));
-    mem.insert("cherry".to_string(), Entry::Value(Value::Integer(3)));
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+    mem.insert(b"apple".to_vec(), Entry::Value(Value::Integer(1)));
+    mem.insert(b"cherry".to_vec(), Entry::Value(Value::Integer(3)));
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
-    assert_eq!(sst.get("banana").unwrap(), None); // between existing keys
-    assert_eq!(sst.get("aaa").unwrap(), None);    // before the first key
-    assert_eq!(sst.get("zzz").unwrap(), None);    // after the last key
+    assert_eq!(sst.get(b"banana").unwrap(), None); // between existing keys
+    assert_eq!(sst.get(b"aaa").unwrap(), None);    // before the first key
+    assert_eq!(sst.get(b"zzz").unwrap(), None);    // after the last key
 
     teardown(&path);
 }
@@ -64,9 +64,9 @@ fn test_missing_key_returns_none() {
 fn test_lookup_across_multiple_blocks() {
     let path = setup("multiblock");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
     for i in 0..1000 {
-        mem.insert(format!("key_{:06}", i), Entry::Value(Value::Integer(i)));
+        mem.insert(format!("key_{:06}", i).into_bytes(), Entry::Value(Value::Integer(i)));
     }
     SsTable::flush(&path, mem.iter()).unwrap();
 
@@ -74,11 +74,11 @@ fn test_lookup_across_multiple_blocks() {
     assert!(sst.block_count() > 1, "1000 records should span multiple blocks");
 
     // Probe the first, last, and several interior keys.
-    assert_eq!(sst.get("key_000000").unwrap(), Some(Entry::Value(Value::Integer(0))));
-    assert_eq!(sst.get("key_000999").unwrap(), Some(Entry::Value(Value::Integer(999))));
-    assert_eq!(sst.get("key_000500").unwrap(), Some(Entry::Value(Value::Integer(500))));
-    assert_eq!(sst.get("key_000250").unwrap(), Some(Entry::Value(Value::Integer(250))));
-    assert_eq!(sst.get("key_000750").unwrap(), Some(Entry::Value(Value::Integer(750))));
+    assert_eq!(sst.get(b"key_000000").unwrap(), Some(Entry::Value(Value::Integer(0))));
+    assert_eq!(sst.get(b"key_000999").unwrap(), Some(Entry::Value(Value::Integer(999))));
+    assert_eq!(sst.get(b"key_000500").unwrap(), Some(Entry::Value(Value::Integer(500))));
+    assert_eq!(sst.get(b"key_000250").unwrap(), Some(Entry::Value(Value::Integer(250))));
+    assert_eq!(sst.get(b"key_000750").unwrap(), Some(Entry::Value(Value::Integer(750))));
 
     teardown(&path);
 }
@@ -88,14 +88,14 @@ fn test_lookup_across_multiple_blocks() {
 fn test_tombstone_roundtrip() {
     let path = setup("tombstone");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
-    mem.insert("alive".to_string(), Entry::Value(Value::Integer(1)));
-    mem.insert("dead".to_string(), Entry::Tombstone);
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+    mem.insert(b"alive".to_vec(), Entry::Value(Value::Integer(1)));
+    mem.insert(b"dead".to_vec(), Entry::Tombstone);
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
-    assert_eq!(sst.get("alive").unwrap(), Some(Entry::Value(Value::Integer(1))));
-    assert_eq!(sst.get("dead").unwrap(), Some(Entry::Tombstone));
+    assert_eq!(sst.get(b"alive").unwrap(), Some(Entry::Value(Value::Integer(1))));
+    assert_eq!(sst.get(b"dead").unwrap(), Some(Entry::Tombstone));
 
     teardown(&path);
 }
@@ -105,8 +105,8 @@ fn test_tombstone_roundtrip() {
 fn test_crc_detects_corruption() {
     let path = setup("crc");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
-    mem.insert("key".to_string(), Entry::Value(Value::Text("important".to_string())));
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+    mem.insert(b"key".to_vec(), Entry::Value(Value::Text("important".to_string())));
     SsTable::flush(&path, mem.iter()).unwrap();
 
     // Corrupt the very first byte of the file (inside the first data block).
@@ -115,7 +115,7 @@ fn test_crc_detects_corruption() {
     fs::write(&path, &bytes).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
-    let result = sst.get("key");
+    let result = sst.get(b"key");
     assert!(result.is_err(), "corrupted block must be rejected by CRC, got {:?}", result);
 
     teardown(&path);
@@ -126,9 +126,9 @@ fn test_crc_detects_corruption() {
 fn test_block_cache_populates_and_serves() {
     let path = setup("block_cache");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
     for i in 0..100 {
-        mem.insert(format!("key_{:03}", i), Entry::Value(Value::Integer(i)));
+        mem.insert(format!("key_{:03}", i).into_bytes(), Entry::Value(Value::Integer(i)));
     }
     SsTable::flush(&path, mem.iter()).unwrap();
 
@@ -136,12 +136,12 @@ fn test_block_cache_populates_and_serves() {
     assert_eq!(sst.cached_blocks(), 0, "cache starts empty");
 
     // First read loads the block into the cache.
-    assert_eq!(sst.get("key_050").unwrap(), Some(Entry::Value(Value::Integer(50))));
+    assert_eq!(sst.get(b"key_050").unwrap(), Some(Entry::Value(Value::Integer(50))));
     assert!(sst.cached_blocks() >= 1, "a read must populate the block cache");
 
     // Every key still resolves correctly, now served from the cache.
     for i in 0..100 {
-        assert_eq!(sst.get(&format!("key_{:03}", i)).unwrap(), Some(Entry::Value(Value::Integer(i))));
+        assert_eq!(sst.get(format!("key_{:03}", i).as_bytes()).unwrap(), Some(Entry::Value(Value::Integer(i))));
     }
 
     teardown(&path);
@@ -152,12 +152,12 @@ fn test_block_cache_populates_and_serves() {
 fn test_empty_sstable() {
     let path = setup("empty");
 
-    let mem: BTreeMap<String, Entry> = BTreeMap::new();
+    let mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
     assert_eq!(sst.block_count(), 0);
-    assert_eq!(sst.get("anything").unwrap(), None);
+    assert_eq!(sst.get(b"anything").unwrap(), None);
     assert_eq!(sst.key_range(), None, "an empty table has no key range");
 
     teardown(&path);
@@ -168,14 +168,14 @@ fn test_empty_sstable() {
 fn test_key_range_reports_min_and_max() {
     let path = setup("key_range");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
-    mem.insert("d".to_string(), Entry::Value(Value::Integer(4)));
-    mem.insert("a".to_string(), Entry::Value(Value::Integer(1)));
-    mem.insert("q".to_string(), Entry::Value(Value::Integer(17)));
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+    mem.insert(b"d".to_vec(), Entry::Value(Value::Integer(4)));
+    mem.insert(b"a".to_vec(), Entry::Value(Value::Integer(1)));
+    mem.insert(b"q".to_vec(), Entry::Value(Value::Integer(17)));
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
-    assert_eq!(sst.key_range(), Some(("a", "q")));
+    assert_eq!(sst.key_range(), Some((b"a".as_slice(), b"q".as_slice())));
 
     teardown(&path);
 }
@@ -186,23 +186,23 @@ fn test_key_range_reports_min_and_max() {
 fn test_bloom_no_false_negatives() {
     let path = setup("bloom_no_fn");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
     for i in 0..500 {
-        mem.insert(format!("key_{:04}", i), Entry::Value(Value::Integer(i)));
+        mem.insert(format!("key_{:04}", i).into_bytes(), Entry::Value(Value::Integer(i)));
     }
     // A deletion: its key must still be in the bloom so a lookup finds the tombstone.
-    mem.insert("key_0123".to_string(), Entry::Tombstone);
+    mem.insert(b"key_0123".to_vec(), Entry::Tombstone);
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
     for key in mem.keys() {
-        assert!(sst.might_contain(key), "bloom must never reject a present key: {}", key);
+        assert!(sst.might_contain(key), "bloom must never reject a present key: {:?}", key);
     }
 
     // A clearly-absent key still resolves correctly through the bloom-skip path.
-    assert_eq!(sst.get("definitely_missing").unwrap(), None);
+    assert_eq!(sst.get(b"definitely_missing").unwrap(), None);
     // The deleted key is found as a tombstone (bloom did not skip it).
-    assert_eq!(sst.get("key_0123").unwrap(), Some(Entry::Tombstone));
+    assert_eq!(sst.get(b"key_0123").unwrap(), Some(Entry::Tombstone));
 
     teardown(&path);
 }
@@ -212,11 +212,11 @@ fn test_bloom_no_false_negatives() {
 fn test_bloom_empty_table_rejects_all() {
     let path = setup("bloom_empty");
 
-    let mem: BTreeMap<String, Entry> = BTreeMap::new();
+    let mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
-    assert!(!sst.might_contain("anything"));
+    assert!(!sst.might_contain(b"anything"));
 
     teardown(&path);
 }
@@ -226,16 +226,16 @@ fn test_bloom_empty_table_rejects_all() {
 fn test_out_of_range_key_skipped() {
     let path = setup("out_of_range");
 
-    let mut mem: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut mem: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
     for k in ["m", "n", "o", "p"] {
-        mem.insert(k.to_string(), Entry::Value(Value::Integer(1)));
+        mem.insert(k.as_bytes().to_vec(), Entry::Value(Value::Integer(1)));
     }
     SsTable::flush(&path, mem.iter()).unwrap();
 
     let sst = SsTable::open(&path).unwrap();
-    assert_eq!(sst.get("a").unwrap(), None, "key before the range");
-    assert_eq!(sst.get("z").unwrap(), None, "key after the range");
-    assert_eq!(sst.get("n").unwrap(), Some(Entry::Value(Value::Integer(1))));
+    assert_eq!(sst.get(b"a").unwrap(), None, "key before the range");
+    assert_eq!(sst.get(b"z").unwrap(), None, "key after the range");
+    assert_eq!(sst.get(b"n").unwrap(), Some(Entry::Value(Value::Integer(1))));
 
     teardown(&path);
 }

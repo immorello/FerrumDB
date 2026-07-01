@@ -91,14 +91,16 @@ fn test_put_batch_is_atomic_and_get_batch() {
 }
 
 #[test]
-fn test_invalid_utf8_key_is_rejected() {
-    let root = setup("bad_key");
+fn test_arbitrary_byte_keys() {
+    let root = setup("byte_keys");
     let mut db = Database::open(&root).unwrap();
     let mut t = db.table("kv").unwrap();
 
-    let bad: &[u8] = &[0xff, 0xfe]; // not valid UTF-8
-    assert!(matches!(t.put(bad, b"x"), Err(Error::InvalidKey)));
-    assert!(matches!(t.get(bad), Err(Error::InvalidKey)));
+    // Keys are arbitrary bytes, including non-UTF-8 and embedded nulls.
+    let binary_key: &[u8] = &[0xff, 0x00, 0xfe, 42];
+    t.put(binary_key, b"value").unwrap();
+    assert_eq!(t.get(binary_key).unwrap(), Some(b"value".to_vec()));
+    assert!(t.contains(binary_key).unwrap());
 
     teardown(&root);
 }

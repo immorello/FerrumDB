@@ -70,7 +70,7 @@ impl Wal {
     pub fn write_commit(&mut self, sequence: u64) -> Result<(), AppError> {
         let commit_entry = WalEntry {
             operation: Operation::Commit.into(),
-            key: String::new(),
+            key: Vec::new(),
             value: None,
             sequence,
             timestamp: 0,
@@ -200,7 +200,7 @@ fn parse_buffer(buffer: &[u8]) -> (Vec<WalEntry>, usize, usize) {
 /// Helper functions for creating WAL entries from store operations
 impl Wal {
     /// Creates a PUT entry for storing a value
-    pub fn create_put_entry(key: String, value: &crate::store::Value, sequence: u64) -> WalEntry {
+    pub fn create_put_entry(key: Vec<u8>, value: &crate::store::Value, sequence: u64) -> WalEntry {
         WalEntry {
             operation: Operation::Put.into(),
             key,
@@ -211,7 +211,7 @@ impl Wal {
     }
 
     /// Creates a DELETE entry for removing a value
-    pub fn create_delete_entry(key: String, sequence: u64) -> WalEntry {
+    pub fn create_delete_entry(key: Vec<u8>, sequence: u64) -> WalEntry {
         WalEntry {
             operation: Operation::Delete.into(),
             key,

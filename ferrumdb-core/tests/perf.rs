@@ -29,7 +29,7 @@ fn perf_sequential_write_throughput() {
 
     let start = Instant::now();
     for i in 0..N {
-        store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
+        store.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32)).unwrap();
     }
     let elapsed = start.elapsed();
 
@@ -49,12 +49,12 @@ fn perf_read_throughput() {
     let mut store = Store::open_with_dir(&dir).unwrap();
 
     for i in 0..N {
-        store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
+        store.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32)).unwrap();
     }
 
     let start = Instant::now();
     for i in 0..N {
-        let _ = store.get_value(&format!("key_{:06}", i));
+        let _ = store.get_value(format!("key_{:06}", i).as_bytes());
     }
     let elapsed = start.elapsed();
 
@@ -75,7 +75,7 @@ fn perf_wal_replay_on_open() {
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
         for i in 0..N {
-            store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
+            store.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32)).unwrap();
         }
         // No flush — all N entries remain in the WAL.
     }
@@ -100,7 +100,7 @@ fn perf_flush() {
     let mut store = Store::open_with_dir(&dir).unwrap();
 
     for i in 0..N {
-        store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
+        store.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32)).unwrap();
     }
 
     let start = Instant::now();
@@ -125,14 +125,14 @@ fn perf_sstable_absent_read() {
 
     let mut tx = store.begin_transaction();
     for i in 0..N {
-        tx.set_value(format!("key_{:06}", i), Value::Integer(i as i32));
+        tx.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32));
     }
     tx.commit().unwrap();
     store.flush().unwrap(); // data now lives in an SSTable; memtable is empty
 
     let start = Instant::now();
     for i in 0..N {
-        let _ = store.get_value(&format!("absent_{:06}", i));
+        let _ = store.get_value(format!("absent_{:06}", i).as_bytes());
     }
     let elapsed = start.elapsed();
 
@@ -154,14 +154,14 @@ fn perf_sstable_present_read() {
 
     let mut tx = store.begin_transaction();
     for i in 0..N {
-        tx.set_value(format!("key_{:06}", i), Value::Integer(i as i32));
+        tx.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32));
     }
     tx.commit().unwrap();
     store.flush().unwrap(); // data now lives in an SSTable; memtable is empty
 
     let start = Instant::now();
     for i in 0..N {
-        let _ = store.get_value(&format!("key_{:06}", i));
+        let _ = store.get_value(format!("key_{:06}", i).as_bytes());
     }
     let elapsed = start.elapsed();
 
@@ -183,7 +183,7 @@ fn perf_batched_transaction() {
     let start = Instant::now();
     let mut tx = store.begin_transaction();
     for i in 0..N {
-        tx.set_value(format!("key_{:06}", i), Value::Integer(i as i32));
+        tx.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32));
     }
     tx.commit().unwrap();
     let elapsed = start.elapsed();
@@ -205,8 +205,8 @@ fn perf_mixed_write_read() {
 
     let start = Instant::now();
     for i in 0..N {
-        store.set_value(format!("key_{:06}", i), Value::Integer(i as i32)).unwrap();
-        let _ = store.get_value(&format!("key_{:06}", i));
+        store.set_value(format!("key_{:06}", i).into_bytes(), Value::Integer(i as i32)).unwrap();
+        let _ = store.get_value(format!("key_{:06}", i).as_bytes());
     }
     let elapsed = start.elapsed();
 

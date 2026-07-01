@@ -31,16 +31,16 @@ fn test_flush_creates_sstable_and_empties_memtable() {
     let dir = setup("creates_sstable");
     let mut store = Store::open_with_dir(&dir).unwrap();
 
-    store.set_value("a".to_string(), Value::Integer(1)).unwrap();
-    store.set_value("b".to_string(), Value::Integer(2)).unwrap();
+    store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
+    store.set_value(b"b".to_vec(), Value::Integer(2)).unwrap();
     store.flush().unwrap();
 
     assert_eq!(count_sstables(&dir), 1, "flush should write exactly one SSTable");
     assert!(store.get_data().is_empty(), "memtable should be empty after flush");
 
     // Data is still readable — now served from the SSTable.
-    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Integer(2)));
 
     teardown(&dir);
 }
@@ -63,11 +63,11 @@ fn test_memtable_shadows_sstable() {
     let dir = setup("memtable_shadows");
     let mut store = Store::open_with_dir(&dir).unwrap();
 
-    store.set_value("k".to_string(), Value::Integer(1)).unwrap();
+    store.set_value(b"k".to_vec(), Value::Integer(1)).unwrap();
     store.flush().unwrap(); // SSTable: k = 1
-    store.set_value("k".to_string(), Value::Integer(2)).unwrap(); // memtable: k = 2
+    store.set_value(b"k".to_vec(), Value::Integer(2)).unwrap(); // memtable: k = 2
 
-    assert_eq!(store.get_value("k").unwrap(), Some(Value::Integer(2)), "memtable must win over SSTable");
+    assert_eq!(store.get_value(b"k").unwrap(), Some(Value::Integer(2)), "memtable must win over SSTable");
 
     teardown(&dir);
 }
@@ -79,16 +79,16 @@ fn test_newest_sstable_wins() {
 
     {
         let mut store = Store::open_with_dir(&dir).unwrap();
-        store.set_value("k".to_string(), Value::Integer(1)).unwrap();
+        store.set_value(b"k".to_vec(), Value::Integer(1)).unwrap();
         store.flush().unwrap(); // sstable_1: k = 1
-        store.set_value("k".to_string(), Value::Integer(2)).unwrap();
+        store.set_value(b"k".to_vec(), Value::Integer(2)).unwrap();
         store.flush().unwrap(); // sstable_2: k = 2
         assert_eq!(count_sstables(&dir), 2);
     }
 
     // Survives reopen too: ordering is reconstructed from file ids.
     let store = Store::open_with_dir(&dir).unwrap();
-    assert_eq!(store.get_value("k").unwrap(), Some(Value::Integer(2)), "newest SSTable must win");
+    assert_eq!(store.get_value(b"k").unwrap(), Some(Value::Integer(2)), "newest SSTable must win");
 
     teardown(&dir);
 }
@@ -99,16 +99,16 @@ fn test_layered_read_across_many_sstables() {
     let dir = setup("layered_read");
     let mut store = Store::open_with_dir(&dir).unwrap();
 
-    store.set_value("a".to_string(), Value::Integer(1)).unwrap();
+    store.set_value(b"a".to_vec(), Value::Integer(1)).unwrap();
     store.flush().unwrap(); // sstable_1: a
-    store.set_value("b".to_string(), Value::Integer(2)).unwrap();
+    store.set_value(b"b".to_vec(), Value::Integer(2)).unwrap();
     store.flush().unwrap(); // sstable_2: b
-    store.set_value("c".to_string(), Value::Integer(3)).unwrap(); // memtable: c
+    store.set_value(b"c".to_vec(), Value::Integer(3)).unwrap(); // memtable: c
 
-    assert_eq!(store.get_value("a").unwrap(), Some(Value::Integer(1)));
-    assert_eq!(store.get_value("b").unwrap(), Some(Value::Integer(2)));
-    assert_eq!(store.get_value("c").unwrap(), Some(Value::Integer(3)));
-    assert_eq!(store.get_value("missing").unwrap(), None);
+    assert_eq!(store.get_value(b"a").unwrap(), Some(Value::Integer(1)));
+    assert_eq!(store.get_value(b"b").unwrap(), Some(Value::Integer(2)));
+    assert_eq!(store.get_value(b"c").unwrap(), Some(Value::Integer(3)));
+    assert_eq!(store.get_value(b"missing").unwrap(), None);
 
     teardown(&dir);
 }
@@ -124,7 +124,7 @@ fn test_auto_flush_bounds_memtable() {
         let mut store = Store::open_with_dir(&dir).unwrap();
         store.set_memtable_budget(64); // bytes — tiny, forces frequent flushes
         for i in 0..50 {
-            store.set_value(format!("key_{:03}", i), Value::Integer(i)).unwrap();
+            store.set_value(format!("key_{:03}", i).into_bytes(), Value::Integer(i)).unwrap();
         }
 
         assert!(count_sstables(&dir) >= 1, "small budget must trigger auto-flush");
@@ -139,7 +139,7 @@ fn test_auto_flush_bounds_memtable() {
     let store = Store::open_with_dir(&dir).unwrap();
     for i in 0..50 {
         assert_eq!(
-            store.get_value(&format!("key_{:03}", i)).unwrap(),
+            store.get_value(format!("key_{:03}", i).as_bytes()).unwrap(),
             Some(Value::Integer(i)),
             "key_{:03} must survive auto-flush and recovery",
             i

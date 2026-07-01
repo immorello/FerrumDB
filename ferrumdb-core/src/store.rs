@@ -23,8 +23,8 @@ const DEFAULT_MEMTABLE_MAX_BYTES: usize = 4 << 20; // 4 MiB
 const MAX_SSTABLES: usize = 8;
 
 enum TxOp {
-    Put(String, Value),
-    Delete(String),
+    Put(Vec<u8>, Value),
+    Delete(Vec<u8>),
 }
 
 /// A buffered, atomic unit of work against a single table.
@@ -83,7 +83,8 @@ impl Value {
 pub struct Store {
     // The memtable. Holds committed values and tombstones (deletion markers).
     // A tombstone shadows any older value for the same key in the SSTables below.
-    data: BTreeMap<String, Entry>,
+    // Keys are arbitrary bytes, sorted lexicographically.
+    data: BTreeMap<Vec<u8>, Entry>,
     // Running estimate of the memtable's live data size in bytes (keys + values).
     // Drives the flush decision; kept in sync by `memtable_insert`.
     memtable_bytes: usize,
@@ -102,7 +103,7 @@ pub struct Store {
 impl Store {
     /// Returns the in-memory portion of the table (the memtable). Data that has
     /// been flushed to SSTables is not included.
-    pub fn get_data(&self) -> &BTreeMap<String, Entry> {
+    pub fn get_data(&self) -> &BTreeMap<Vec<u8>, Entry> {
         &self.data
     }
 
@@ -114,7 +115,7 @@ impl Store {
 
     /// Inserts into the memtable, keeping the byte estimate in sync. Replacing an
     /// existing key subtracts the old footprint before adding the new one.
-    fn memtable_insert(&mut self, key: String, entry: Entry) {
+    fn memtable_insert(&mut self, key: Vec<u8>, entry: Entry) {
         self.memtable_bytes += entry_footprint(&key, &entry);
         if let Some(old) = self.data.get(&key) {
             self.memtable_bytes -= entry_footprint(&key, old);
@@ -286,7 +287,7 @@ impl Store {
         }
 
         // Merge oldest -> newest so a newer entry overwrites an older one.
-        let mut merged: BTreeMap<String, Entry> = BTreeMap::new();
+        let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
         for sst in self.sstables.iter().rev() {
             for (key, entry) in sst.read_all_entries()? {
                 merged.insert(key, entry);
@@ -315,20 +316,20 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_value(&mut self, new_key: String, new_value: Value) -> Result<String, AppError> {
+    pub fn set_value(&mut self, new_key: Vec<u8>, new_value: Value) -> Result<String, AppError> {
         self.sequence += 1;
         let entry = Wal::create_put_entry(new_key.clone(), &new_value, self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
-        self.memtable_insert(new_key.clone(), Entry::Value(new_value));
+        self.memtable_insert(new_key, Entry::Value(new_value));
         self.maybe_flush()?;
-        Ok(format!("Inserted value with key {}", new_key))
+        Ok("Inserted value".to_string())
     }
 
     /// Looks up a key. Checks the memtable first, then SSTables from newest to
     /// oldest; the first source that has the key wins. A tombstone resolves to
     /// `None`, the same as a key that was never written.
-    pub fn get_value(&self, key: &str) -> Result<Option<Value>, AppError> {
+    pub fn get_value(&self, key: &[u8]) -> Result<Option<Value>, AppError> {
         match self.data.get(key) {
             Some(Entry::Value(v)) => return Ok(Some(v.clone())),
             Some(Entry::Tombstone) => return Ok(None),
@@ -349,14 +350,14 @@ impl Store {
     /// Deletes a key by writing a tombstone. Idempotent: deleting a key that does
     /// not exist is not an error, because the key may live in an SSTable whose
     /// membership cannot be checked without a disk read.
-    pub fn delete_value(&mut self, key: &str) -> Result<String, AppError> {
+    pub fn delete_value(&mut self, key: &[u8]) -> Result<String, AppError> {
         self.sequence += 1;
-        let entry = Wal::create_delete_entry(key.to_string(), self.sequence);
+        let entry = Wal::create_delete_entry(key.to_vec(), self.sequence);
         self.wal.append(&entry)?;
         self.wal.write_commit(self.sequence)?;
-        self.memtable_insert(key.to_string(), Entry::Tombstone);
+        self.memtable_insert(key.to_vec(), Entry::Tombstone);
         self.maybe_flush()?;
-        Ok(format!("Deleted value with key {}", key))
+        Ok("Deleted value".to_string())
     }
 
     /// Begins an explicit multi-write transaction.
@@ -377,7 +378,7 @@ fn sstable_id_from_path(path: &Path) -> Option<u64> {
 
 /// Approximate in-memory footprint of one memtable entry: the key bytes plus the
 /// value bytes. Used only to drive the flush budget, so an estimate is fine.
-fn entry_footprint(key: &str, entry: &Entry) -> usize {
+fn entry_footprint(key: &[u8], entry: &Entry) -> usize {
     let value_bytes = match entry {
         Entry::Value(Value::Integer(_)) => 4,
         Entry::Value(Value::Float(_)) => 8,
@@ -390,14 +391,14 @@ fn entry_footprint(key: &str, entry: &Entry) -> usize {
 }
 
 impl<'a> Transaction<'a> {
-    pub fn set_value(&mut self, key: String, value: Value) {
+    pub fn set_value(&mut self, key: Vec<u8>, value: Value) {
         self.ops.push(TxOp::Put(key, value));
     }
 
     /// Buffers a delete. Idempotent — deleting a key that does not exist is not
     /// an error, matching `Store::delete_value`. The delete is applied as a
     /// tombstone when the transaction commits.
-    pub fn delete_value(&mut self, key: String) {
+    pub fn delete_value(&mut self, key: Vec<u8>) {
         self.ops.push(TxOp::Delete(key));
     }
 

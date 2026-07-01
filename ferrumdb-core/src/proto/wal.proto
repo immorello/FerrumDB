@@ -14,8 +14,8 @@ enum Operation {
 // Write-Ahead Log entry
 // Represents a single operation to be applied to the store
 message WalEntry {
-  Operation operation = 1;  // PUT or DELETE
-  string key = 2;            // Key for the operation
+  Operation operation = 1;  // PUT, DELETE, or COMMIT
+  bytes key = 2;             // Key for the operation (arbitrary bytes)
   ValueMessage value = 3;   // Value (only used for PUT operations)
   uint64 sequence = 4;       // Monotonically increasing sequence number
   uint64 timestamp = 5;      // Optional timestamp
