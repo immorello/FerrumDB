@@ -1,6 +1,11 @@
+use std::ops::Bound;
+
 use ferrumdb_core::store::{Store, Value};
 
 use crate::error::Error;
+
+/// A list of key/value pairs, as returned by scans.
+pub type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// A handle to one table, borrowed from a [`crate::Database`].
 ///
@@ -53,4 +58,49 @@ impl Table<'_> {
     pub fn get_batch(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, Error> {
         keys.iter().map(|&key| self.get(key)).collect()
     }
+
+    /// Returns every key/value pair in the table, in ascending key order.
+    pub fn scan(&self) -> Result<Pairs, Error> {
+        self.range_bounds(Bound::Unbounded, Bound::Unbounded)
+    }
+
+    /// Returns key/value pairs in the half-open key range `[start, end)`, sorted.
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Pairs, Error> {
+        self.range_bounds(Bound::Included(start), Bound::Excluded(end))
+    }
+
+    /// Returns every key/value pair whose key begins with `prefix`, sorted.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Pairs, Error> {
+        let upper = prefix_upper_bound(prefix);
+        let hi = match &upper {
+            Some(u) => Bound::Excluded(u.as_slice()),
+            None => Bound::Unbounded, // empty or all-0xFF prefix has no upper bound
+        };
+        self.range_bounds(Bound::Included(prefix), hi)
+    }
+
+    fn range_bounds(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> Result<Pairs, Error> {
+        let mut out = Vec::new();
+        for (key, value) in self.store.scan_range(lo, hi)? {
+            match value {
+                Value::Bytes(bytes) => out.push((key, bytes)),
+                _ => return Err(Error::UnexpectedValue),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The smallest key that is greater than every key beginning with `prefix`, or
+/// `None` if there is none (an empty prefix, or one that is entirely `0xFF`).
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(end);
+        }
+        end.pop();
+    }
+    None
 }

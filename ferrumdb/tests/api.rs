@@ -141,6 +141,43 @@ fn test_invalid_table_name_is_rejected() {
 }
 
 #[test]
+fn test_scan_range_and_prefix() {
+    let root = setup("scan");
+    let mut db = Database::open(&root).unwrap();
+    let mut t = db.table("kv").unwrap();
+
+    t.put_batch(&[
+        (b"user:1", b"alice"),
+        (b"user:2", b"bob"),
+        (b"user:3", b"carol"),
+        (b"post:1", b"hello"),
+    ]).unwrap();
+
+    // Full scan is sorted across all keys.
+    let all: Vec<Vec<u8>> = t.scan().unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(all, vec![
+        b"post:1".to_vec(),
+        b"user:1".to_vec(),
+        b"user:2".to_vec(),
+        b"user:3".to_vec(),
+    ]);
+
+    // Prefix scan returns only the "user:" keys, with values.
+    let users = t.scan_prefix(b"user:").unwrap();
+    assert_eq!(users, vec![
+        (b"user:1".to_vec(), b"alice".to_vec()),
+        (b"user:2".to_vec(), b"bob".to_vec()),
+        (b"user:3".to_vec(), b"carol".to_vec()),
+    ]);
+
+    // Half-open range.
+    let mid: Vec<Vec<u8>> = t.range(b"user:1", b"user:3").unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(mid, vec![b"user:1".to_vec(), b"user:2".to_vec()]);
+
+    teardown(&root);
+}
+
+#[test]
 fn test_data_persists_across_reopen() {
     let root = setup("persist");
 

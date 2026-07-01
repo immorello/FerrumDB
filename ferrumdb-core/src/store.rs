@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -347,6 +348,47 @@ impl Store {
         Ok(None)
     }
 
+    /// Returns all key/value pairs whose key falls within `(lo, hi)`, in ascending
+    /// key order. Merges the memtable with every SSTable — newest value per key
+    /// wins, tombstoned keys are excluded. SSTables whose key range does not
+    /// overlap the bounds are skipped without a read.
+    ///
+    /// This materializes the matching range in memory; a streaming, block-ranged
+    /// iterator is a future optimization.
+    pub fn scan_range(
+        &self,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Value)>, AppError> {
+        let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+
+        // Oldest -> newest so a newer entry overwrites an older one: SSTables from
+        // oldest to newest, then the memtable (newest of all).
+        for sst in self.sstables.iter().rev() {
+            if let Some((min, max)) = sst.key_range()
+                && !range_overlaps(min, max, lo, hi)
+            {
+                continue;
+            }
+            for (key, entry) in sst.read_all_entries()? {
+                if in_bounds(&key, lo, hi) {
+                    merged.insert(key, entry);
+                }
+            }
+        }
+        for (key, entry) in self.data.range::<[u8], _>((lo, hi)) {
+            merged.insert(key.clone(), entry.clone());
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter_map(|(key, entry)| match entry {
+                Entry::Value(v) => Some((key, v)),
+                Entry::Tombstone => None,
+            })
+            .collect())
+    }
+
     /// Deletes a key by writing a tombstone. Idempotent: deleting a key that does
     /// not exist is not an error, because the key may live in an SSTable whose
     /// membership cannot be checked without a disk read.
@@ -374,6 +416,36 @@ impl Store {
 fn sstable_id_from_path(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
     name.strip_prefix("sstable_")?.strip_suffix(".sst")?.parse::<u64>().ok()
+}
+
+/// Whether `key` lies within the `(lo, hi)` bounds.
+fn in_bounds(key: &[u8], lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> bool {
+    let above_lo = match lo {
+        Bound::Unbounded => true,
+        Bound::Included(b) => key >= b,
+        Bound::Excluded(b) => key > b,
+    };
+    let below_hi = match hi {
+        Bound::Unbounded => true,
+        Bound::Included(b) => key <= b,
+        Bound::Excluded(b) => key < b,
+    };
+    above_lo && below_hi
+}
+
+/// Whether an SSTable spanning `[min, max]` can contain any key within `(lo, hi)`.
+fn range_overlaps(min: &[u8], max: &[u8], lo: Bound<&[u8]>, hi: Bound<&[u8]>) -> bool {
+    let max_below_lo = match lo {
+        Bound::Unbounded => false,
+        Bound::Included(b) => max < b,
+        Bound::Excluded(b) => max <= b,
+    };
+    let min_above_hi = match hi {
+        Bound::Unbounded => false,
+        Bound::Included(b) => min > b,
+        Bound::Excluded(b) => min >= b,
+    };
+    !max_below_lo && !min_above_hi
 }
 
 /// Approximate in-memory footprint of one memtable entry: the key bytes plus the

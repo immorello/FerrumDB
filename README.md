@@ -28,11 +28,16 @@ assert_eq!(users.get(b"user:42")?, Some(b"alice".to_vec()));
 users.put_batch(&[(b"user:1", b"bob"), (b"user:2", b"carol")])?;
 let found = users.get_batch(&[b"user:1", b"user:42"])?;
 
+// Sorted scans.
+let everything = users.scan()?;                  // all pairs, ascending
+let some = users.range(b"user:1", b"user:3")?;   // half-open [start, end)
+let by_prefix = users.scan_prefix(b"user:")?;    // keys starting with "user:"
+
 users.delete(b"user:42")?;
 # Ok::<(), ferrumdb::Error>(())
 ```
 
-The API surface is deliberately small: `Database` (`open`, `create_table`, `table`, `delete_table`, `list_tables`) and `Table` (`put`, `get`, `delete`, `contains`, `put_batch`, `get_batch`). Range scans, interactive transactions, and C/Python bindings are planned (see Roadmap).
+The API surface is deliberately small: `Database` (`open`, `create_table`, `table`, `delete_table`, `list_tables`) and `Table` (`put`, `get`, `delete`, `contains`, `put_batch`, `get_batch`, `scan`, `range`, `scan_prefix`). Interactive transactions and C/Python bindings are planned (see Roadmap).
 
 ---
 
@@ -161,6 +166,7 @@ Integration tests cover nine areas:
 - `tests/sstable.rs` — flush/read roundtrip, missing keys, lookup across multiple blocks, tombstone roundtrip, CRC corruption detection, empty table, key-range reporting and out-of-range skip, bloom-filter no-false-negatives and empty-table rejection, block-cache populate-and-serve
 - `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, byte-budget auto-flush bounds the memtable
 - `tests/compaction.rs` — merge into one, newest value wins, deleted keys dropped, all-deleted leaves nothing, compaction survives recovery, auto-compaction bounds the SSTable count
+- `tests/scan.rs` — full scan sorted, memtable+SSTable merge, half-open range, newest value wins, deleted keys excluded
 - `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, absent- and present-key SSTable reads (bloom + block cache), WAL replay time, flush time
 - `ferrumdb/tests/api.rs` — the public API: put/get/delete, overwrite, arbitrary byte values, contains, atomic batch put/get, invalid-UTF-8 key rejection, table create/list/delete, invalid table names, persistence across reopen, table independence
 
@@ -204,7 +210,8 @@ The fundamentals are in place; the goal here was to make the engine as fast as i
 
 - ✅ A minimal public Rust API (`ferrumdb` crate): a `Database` handle managing named tables, and a `Table` with byte `put`/`get`/`delete`/`contains` and atomic `put_batch`/`get_batch`. Keys and values are arbitrary bytes.
 - ✅ Arbitrary binary keys — keys are `Vec<u8>` throughout the engine (memtable, WAL, SSTable), sorted lexicographically.
-- ⬜ Range scans and interactive multi-operation transactions (needs a cross-SSTable merge iterator).
+- ✅ Range scans — `scan` / `range` / `scan_prefix`, merging the memtable with all SSTables (newest value per key, tombstones excluded), skipping SSTables whose key range does not overlap. Materializes the range in memory for now; a streaming, block-ranged iterator is a future optimization.
+- ⬜ Interactive multi-operation transactions (read-your-writes, then commit or roll back).
 - ⬜ A C FFI layer (`cdylib`) so FerrumDB can be used from C, Swift, and other languages — the same way SQLite is embedded across ecosystems.
 - ⬜ Python bindings (via the C layer or PyO3).
 

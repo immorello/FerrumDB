@@ -30,4 +30,4 @@ mod table;
 
 pub use database::Database;
 pub use error::Error;
-pub use table::Table;
+pub use table::{Pairs, Table};
