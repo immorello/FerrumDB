@@ -44,6 +44,7 @@ pub enum Value {
     Float(f64),
     Text(String),
     Boolean(bool),
+    Bytes(Vec<u8>),
 }
 
 impl Value {
@@ -56,6 +57,7 @@ impl Value {
             Value::Float(n) => Kind::Float(*n),
             Value::Text(s) => Kind::Text(s.clone()),
             Value::Boolean(b) => Kind::Boolean(*b),
+            Value::Bytes(b) => Kind::Data(b.clone()),
         };
         ValueMessage { kind: Some(kind) }
     }
@@ -67,6 +69,7 @@ impl Value {
             Some(Kind::Float(n)) => Ok(Value::Float(*n)),
             Some(Kind::Text(s)) => Ok(Value::Text(s.clone())),
             Some(Kind::Boolean(b)) => Ok(Value::Boolean(*b)),
+            Some(Kind::Data(b)) => Ok(Value::Bytes(b.clone())),
             None => Err(AppError::DecodeError(
                 "value message has no kind set".to_string(),
             )),
@@ -380,6 +383,7 @@ fn entry_footprint(key: &str, entry: &Entry) -> usize {
         Entry::Value(Value::Float(_)) => 8,
         Entry::Value(Value::Boolean(_)) => 1,
         Entry::Value(Value::Text(s)) => s.len(),
+        Entry::Value(Value::Bytes(b)) => b.len(),
         Entry::Tombstone => 0,
     };
     key.len() + value_bytes

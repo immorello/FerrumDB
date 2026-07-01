@@ -8,5 +8,6 @@ message ValueMessage {
     double float = 2;
     string text = 3;
     bool boolean = 4;
+    bytes data = 5;
   }
 }

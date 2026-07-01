@@ -4,9 +4,35 @@
 
 # FerrumDB
 
-FerrumDB is an embedded, no-SQL key-value storage engine written in Rust. It stores typed values (integer, float, text, boolean) accessed by key, with durable writes and crash recovery — without a query language and without a server.
+FerrumDB is an embedded, no-SQL key-value storage engine written in Rust. It stores byte values under UTF-8 keys, organized into named tables, with durable writes and crash recovery — without a query language and without a server. It is meant to be linked directly into an application, the way SQLite is.
 
 The target is the space that SQLite owns for relational data, applied to key-value workloads: IoT devices, edge nodes, mobile applications, and local-first software that needs a lightweight but correct persistent store.
+
+---
+
+## Usage (Rust)
+
+The public API lives in the `ferrumdb` crate (the `ferrumdb-core` crate is the engine it wraps). Keys are UTF-8 byte slices; values are arbitrary bytes.
+
+```rust
+use ferrumdb::Database;
+
+let mut db = Database::open("./data/app")?;
+db.create_table("users")?;
+
+let mut users = db.table("users")?;
+users.put(b"user:42", b"alice")?;
+assert_eq!(users.get(b"user:42")?, Some(b"alice".to_vec()));
+
+// Atomic batch — all of these land, or none do (one fsync).
+users.put_batch(&[(b"user:1", b"bob"), (b"user:2", b"carol")])?;
+let found = users.get_batch(&[b"user:1", b"user:42"])?;
+
+users.delete(b"user:42")?;
+# Ok::<(), ferrumdb::Error>(())
+```
+
+The API surface is deliberately small: `Database` (`open`, `create_table`, `table`, `delete_table`, `list_tables`) and `Table` (`put`, `get`, `delete`, `contains`, `put_batch`, `get_batch`). Range scans, interactive transactions, and C/Python bindings are planned (see Roadmap).
 
 ---
 
@@ -136,6 +162,7 @@ Integration tests cover nine areas:
 - `tests/flush.rs` — flush creates an SSTable and empties the memtable, empty-flush no-op, memtable shadows SSTable, newest SSTable wins, layered read across many SSTables, byte-budget auto-flush bounds the memtable
 - `tests/compaction.rs` — merge into one, newest value wins, deleted keys dropped, all-deleted leaves nothing, compaction survives recovery, auto-compaction bounds the SSTable count
 - `tests/perf.rs` — write throughput, batched transaction throughput, read throughput, absent- and present-key SSTable reads (bloom + block cache), WAL replay time, flush time
+- `ferrumdb/tests/api.rs` — the public API: put/get/delete, overwrite, arbitrary byte values, contains, atomic batch put/get, invalid-UTF-8 key rejection, table create/list/delete, invalid table names, persistence across reopen, table independence
 
 ---
 
@@ -173,10 +200,13 @@ The fundamentals are in place; the goal here was to make the engine as fast as i
 
 *Group commit was considered and deferred:* it batches independent concurrent commits into one fsync, which needs a multi-threaded writer. FerrumDB is intentionally single-writer, and an explicit transaction already provides "many writes, one fsync," so group commit adds complexity without fitting the model.
 
-### Step 5 — API layer
+### Step 5 — API layer (in progress)
 
-- A minimal public Rust API designed for embedding.
-- A C FFI layer so FerrumDB can be used from C, Swift, Python, and other languages — the same way SQLite is embedded across ecosystems.
+- ✅ A minimal public Rust API (`ferrumdb` crate): a `Database` handle managing named tables, and a `Table` with byte `put`/`get`/`delete`/`contains` and atomic `put_batch`/`get_batch`. Keys are UTF-8, values are arbitrary bytes.
+- ⬜ Range scans and interactive multi-operation transactions (needs a cross-SSTable merge iterator).
+- ⬜ Arbitrary binary keys (currently UTF-8) — a `String → Vec<u8>` engine change, deferred until needed.
+- ⬜ A C FFI layer (`cdylib`) so FerrumDB can be used from C, Swift, and other languages — the same way SQLite is embedded across ecosystems.
+- ⬜ Python bindings (via the C layer or PyO3).
 
 ---
 
