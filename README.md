@@ -144,6 +144,58 @@ Measured on an Apple Mac mini (APFS), 1000-key workloads:
 
 Reads are currently served from the in-memory memtable. Once data ages into SSTables, reads involve disk plus the per-SSTable key-range skip; bloom filters and a block cache (Roadmap) are what will keep that fast.
 
+### Performance on a Raspberry Pi 4 (edge hardware)
+
+FerrumDB targets edge and IoT devices, so the engine was also benchmarked on the class of hardware it is meant to run on: a **Raspberry Pi 4 Model B** (quad-core Cortex-A72, aarch64), Raspberry Pi OS (Debian, kernel 6.18), release build, booting and storing to a **microSD card** — the storage commodity edge devices actually ship with. Same 1000-key workload, reproduced with:
+
+```
+cargo test --release -p ferrumdb-core perf -- --nocapture --test-threads=1
+```
+
+| Operation | Result | Bound by |
+|---|---|---|
+| Single durable write | ~204/sec (~4.9 ms/commit) | `fsync` |
+| Batched transaction (1000 writes, 1 fsync) | ~55,300/sec | per-append CPU + one `fsync` |
+| Read (in-memory) | ~773k/sec | CPU |
+| Absent-key read (on-disk SSTable) | ~1.6M/sec | CPU (bloom skip) |
+| Present-key read (on-disk SSTable) | ~152k/sec | CPU (in-block scan) |
+| Recovery (WAL replay) | ~221k/sec | CPU |
+| Flush 1000 entries → SSTable | ~7.3 ms | CPU |
+
+The comparison with the Mac mini is instructive because the two bottlenecks pull in opposite directions:
+
+- **CPU-bound paths are ~2–6× slower**, as expected from a smaller ARM core — in-memory reads (~773k vs ~0.9–1.9M/sec) and absent-key SSTable lookups (~1.6M vs ~5–12M/sec).
+- **The durability-bound write path is *faster* than on the Mac.** Each durable commit costs ~4.9 ms on the Pi's microSD versus ~9–10 ms on the Mac's APFS `fsync`. Because single writes are `fsync`-bound, the Pi lands ~204/sec against the Mac's ~100/sec — and the flush (~7.3 ms vs ~15 ms) follows the same pattern. This is exactly the ~1–5 ms Linux embedded-storage `fsync` the engine was designed around.
+
+Net: on the very hardware FerrumDB targets, the write path — the one that defines a durable engine — is more than competitive with a desktop, while reads scale down gracefully with the CPU.
+
+> **Note on `fsync` honesty.** A ~4.9 ms `fsync` is fast for a microSD, and some cheap cards (and USB bridges) acknowledge `fsync` before data is truly on flash. For a durability-first engine this is worth verifying on the specific card before treating the write number as fully power-safe.
+
+### How it compares on identical hardware
+
+To put those numbers in context, FerrumDB was benchmarked against the two obvious reference points on the **same Raspberry Pi 4 and the same microSD**, in one session, with the same key workload: **SQLite** (the B-tree engine FerrumDB targets the niche of) and **LevelDB 1.23** (the LSM-tree engine that shares FerrumDB's exact architecture — memtable, immutable SSTables, WAL, bloom filters). SQLite was driven via Python's built-in `sqlite3`; LevelDB via its native `db_bench`.
+
+| Operation | **FerrumDB** (Rust, native) | **LevelDB** (C++, native) | **SQLite** (via Python) |
+|---|---:|---:|---:|
+| Durable single write | 234/sec · 4.27 ms | 241/sec · 4.14 ms | 225/sec · 4.45 ms (WAL) · 77/sec (rollback) |
+| Bulk / batch write (1 fsync) | 87,685/sec | 162,417/sec | 36,774/sec (WAL) · 18,957/sec (rollback) |
+| Point read (present key) | 151,562/sec | 169,205/sec | 24,096/sec |
+| Absent-key read (bloom) | 1,637,814/sec † | 378,644/sec | 37,551/sec |
+
+What the table does and does not say:
+
+- **Durable single writes are a dead heat** — 4.14 / 4.27 / 4.45 ms across all three. This path is `fsync`-bound, so it measures the microSD, not the engine, and FerrumDB sits right on top of both references. (SQLite's rollback-journal mode drops to 77/sec because it `fsync`s more than once per commit; WAL mode is the fair comparison and it ties.)
+- **Point reads land at ~90% of LevelDB** (152k vs 169k) — the cleanest apples-to-apples result here, native-vs-native, same architecture.
+- **Bulk writes are ~54% of LevelDB** and ~2.4× SQLite-WAL. This is FerrumDB's clearest headroom: LevelDB's decade of write-batching and log tuning shows here. It is an optimization gap, not an architectural one.
+
+**Fairness caveats — read these before quoting any number:**
+
+- **SQLite is driven from Python, which handicaps its CPU-bound rows** (batch writes and reads pay Python call + SQL-parse overhead on every operation). Called from C, SQLite would be far closer to the native engines on those rows. **Only SQLite's durable-write row is a fully fair comparison** — and there it ties. The clean native-vs-native comparison is FerrumDB vs LevelDB; SQLite is included for orientation, not as a like-for-like read/batch benchmark.
+- **† The absent-key read is not measured on the same dataset.** FerrumDB's figure is over 1,000 keys in a single SSTable (where the in-RAM key-range check alone often rejects the key before the bloom filter even runs); LevelDB's is over 100,000 keys across multiple levels. Both correctly skip disk via their bloom filters, but the raw numbers are not directly comparable.
+- **Value sizes differ.** `db_bench` uses 100-byte values; the FerrumDB and SQLite runs use small integer values. This shifts write/read throughput somewhat without changing the order of magnitude.
+
+On this hardware, FerrumDB matches SQLite and LevelDB on durable writes, reaches ~90% of LevelDB's point-read throughput, and ~54% of its bulk-write throughput. The bulk-write gap is the largest; write batching and read concurrency are not yet optimized.
+
 ### SSTable Layer
 
 The memtable is flushed to immutable on-disk SSTables, which is what bounds memory on constrained devices. Each SSTable (`ferrumdb-core/src/sstable.rs`) is ~4 KB data blocks each protected by a CRC32, a sparse index (one entry per block), and a fixed footer carrying a magic number and format version. A reader loads only the footer and sparse index into RAM, then serves a point lookup with a single binary search and one block read. Full byte-level spec in [docs/sstable.md](docs/sstable.md).
